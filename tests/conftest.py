@@ -16,43 +16,70 @@ from services.bank_sbi.main import app as sbi_app
 from shared.redis_client import get_redis
 
 @pytest_asyncio.fixture
-async def gateway_client(mock_asyncpg):
-    gateway_app.state.pool = mock_asyncpg
+async def gateway_client(mock_asyncpg, mock_redis):
+    gateway_app.state.db_pool = mock_asyncpg
+    gateway_app.dependency_overrides[get_redis] = lambda: mock_redis
     async with AsyncClient(transport=ASGITransport(app=gateway_app), base_url="http://testserver") as client:
         yield client
+        gateway_app.dependency_overrides.clear()
 
 @pytest_asyncio.fixture
-async def hdfc_client(mock_asyncpg):
+async def hdfc_client(mock_asyncpg, mock_redis):
     hdfc_app.state.pool = mock_asyncpg
+    hdfc_app.dependency_overrides[get_redis] = lambda: mock_redis
     async with AsyncClient(transport=ASGITransport(app=hdfc_app), base_url="http://testserver") as client:
         yield client
+        hdfc_app.dependency_overrides.clear()
 
 @pytest_asyncio.fixture
-async def sbi_client(mock_asyncpg):
+async def sbi_client(mock_asyncpg, mock_redis):
     sbi_app.state.pool = mock_asyncpg
+    sbi_app.dependency_overrides[get_redis] = lambda: mock_redis
     async with AsyncClient(transport=ASGITransport(app=sbi_app), base_url="http://testserver") as client:
         yield client
+        sbi_app.dependency_overrides.clear()
 
 @pytest_asyncio.fixture(autouse=True)
 def mock_redis():
-    """Mock Redis globally for all tests."""
-    mock = AsyncMock()
-    # For SETNX operations (idempotency)
-    mock.set.return_value = True
-    mock.get.return_value = None
+    """Stateful Mock Redis globally for all tests."""
+    store = {}
+    zstore = {}
     
-    # For ZADD, ZCARD, ZREMRANGEBYSCORE operations (rate limiting)
-    mock.zcard.return_value = 0
-    mock.zadd.return_value = 1
-    mock.zremrangebyscore.return_value = 0
-    
-    # For INCRBYFLOAT (daily cap)
-    mock.incrbyfloat.return_value = 500.0
-    
-    # Mock the pipeline
-    pipe_mock = AsyncMock()
-    pipe_mock.execute.return_value = [1, 1, 1]
-    mock.pipeline.return_value = pipe_mock
+    class FakePipeline:
+        async def execute(self):
+            return [1, 1, 1]
+            
+    class FakeRedis:
+        async def get(self, key):
+            return store.get(key)
+            
+        async def set(self, key, value, nx=False, ex=None):
+            if nx and key in store:
+                return False
+            store[key] = value
+            return True
+            
+        async def zcard(self, key):
+            return len(zstore.get(key, []))
+            
+        async def zadd(self, key, mapping):
+            if key not in zstore:
+                zstore[key] = []
+            for name, score in mapping.items():
+                zstore[key].append(score)
+            return 1
+            
+        async def zremrangebyscore(self, key, min_val, max_val):
+            return 0
+            
+        async def incrbyfloat(self, key, amount):
+            store[key] = store.get(key, 0.0) + amount
+            return store[key]
+            
+        def pipeline(self):
+            return FakePipeline()
+            
+    mock = FakeRedis()
     
     # Patch the global redis_client factory
     with patch("shared.redis_client.get_redis", return_value=mock):
@@ -60,14 +87,11 @@ def mock_redis():
 
 @pytest_asyncio.fixture(autouse=True)
 def mock_kafka():
-    """Mock AIOKafkaProducer globally."""
-    mock_producer = AsyncMock()
-    mock_producer.send_and_wait = AsyncMock(return_value=True)
-    mock_producer.start = AsyncMock()
-    mock_producer.stop = AsyncMock()
-    
-    with patch("shared.kafka_client.AIOKafkaProducer", return_value=mock_producer):
-        yield mock_producer
+    """Mock Kafka producer globally."""
+    producer_mock = AsyncMock()
+    producer_mock.send_and_wait = AsyncMock(return_value=True)
+    with patch("shared.kafka_client.producer", producer_mock):
+        yield producer_mock
 
 @pytest_asyncio.fixture(autouse=True)
 def mock_asyncpg():
