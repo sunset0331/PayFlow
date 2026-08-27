@@ -56,52 +56,78 @@ async def enforce_rate_limits(sender_vpa: str, receiver_vpa: str, amount: float,
             ) from e
 
 
+RATE_LIMIT_LUA_SCRIPT = """
+local min_key = KEYS[1]
+local hr_key = KEYS[2]
+local day_key = KEYS[3]
+
+local now = tonumber(ARGV[1])
+local amount = tonumber(ARGV[2])
+local min_limit = tonumber(ARGV[3])
+local hr_limit = tonumber(ARGV[4])
+local day_limit = tonumber(ARGV[5])
+
+-- Rule 3: Daily Limit
+local current_daily = tonumber(redis.call('GET', day_key) or '0')
+if current_daily + amount > day_limit then
+    return 'DAILY_LIMIT_EXCEEDED'
+end
+
+-- Rules 1 & 2: Sliding Windows
+-- Remove old timestamps
+redis.call('ZREMRANGEBYSCORE', min_key, 0, now - 60)
+redis.call('ZREMRANGEBYSCORE', hr_key, 0, now - 3600)
+
+local min_count = tonumber(redis.call('ZCARD', min_key))
+local hr_count = tonumber(redis.call('ZCARD', hr_key))
+
+if min_count >= min_limit then
+    return 'MIN_LIMIT_EXCEEDED'
+end
+
+if hr_count >= hr_limit then
+    return 'HR_LIMIT_EXCEEDED'
+end
+
+-- All checks passed, record the new transaction
+redis.call('ZADD', min_key, now, tostring(now))
+redis.call('EXPIRE', min_key, 60)
+
+redis.call('ZADD', hr_key, now, tostring(now))
+redis.call('EXPIRE', hr_key, 3600)
+
+redis.call('INCRBYFLOAT', day_key, amount)
+redis.call('EXPIRE', day_key, 86400)
+
+return 'OK'
+"""
+
 async def _check_and_record(sender_vpa: str, receiver_vpa: str, amount: float, redis_client):
-    """Inner implementation — all Redis calls are here so the outer function can catch cleanly."""
+    """Inner implementation — atomic evaluation via Lua script."""
     now = time.time()
 
     # Define Redis keys
     min_key = f"rate:min:{sender_vpa}"
     hr_key = f"rate:hr:{sender_vpa}:{receiver_vpa}"
-
-    # We use the current date string for the daily limit
     day_str = time.strftime("%Y-%m-%d")
     day_key = f"rate:daily:{sender_vpa}:{day_str}"
 
-    # RULE 3: Check Daily Limit First (simplest)
-    current_daily = await redis_client.get(day_key)
-    current_daily = float(current_daily) if current_daily else 0.0
-    if current_daily + amount > 100000:
+    result = await redis_client.eval(
+        RATE_LIMIT_LUA_SCRIPT,
+        3,  # Number of keys
+        min_key, hr_key, day_key,  # KEYS
+        now, amount, 10, 5, 100000  # ARGV
+    )
+
+    result_str = result.decode() if isinstance(result, bytes) else result
+
+    if result_str == 'DAILY_LIMIT_EXCEEDED':
         raise HTTPException(status_code=429, detail="Daily limit exceeded: Max ₹100,000 per day.")
-
-    # RULE 1 & 2: Sliding Windows
-    # Remove timestamps older than the window
-    await redis_client.zremrangebyscore(min_key, 0, now - 60)
-    await redis_client.zremrangebyscore(hr_key, 0, now - 3600)
-
-    # Count how many requests occurred inside the remaining window
-    min_count = await redis_client.zcard(min_key)
-    hr_count = await redis_client.zcard(hr_key)
-
-    if min_count >= 10:
+    elif result_str == 'MIN_LIMIT_EXCEEDED':
         raise HTTPException(status_code=429, detail="Rate limit exceeded: Max 10 transactions per minute.")
-
-    if hr_count >= 5:
+    elif result_str == 'HR_LIMIT_EXCEEDED':
         raise HTTPException(status_code=429, detail="Rate limit exceeded: Max 5 transactions to the same VPA per hour.")
-
-    # ALL CHECKS PASSED -> Record this new transaction in Redis
-    # We use a Pipeline to execute all Redis commands in a single network trip for ultra-low latency
-    pipe = redis_client.pipeline()
-
-    # Add current timestamp to sorted sets
-    pipe.zadd(min_key, {str(now): now})
-    pipe.expire(min_key, 60)  # Cleanup memory after window passes
-
-    pipe.zadd(hr_key, {str(now): now})
-    pipe.expire(hr_key, 3600)
-
-    # Increment daily amount tracker
-    pipe.incrbyfloat(day_key, amount)
-    pipe.expire(day_key, 86400)  # Expire after 24 hours
-
-    await pipe.execute()
+    elif result_str == 'OK':
+        return
+    else:
+        raise RuntimeError(f"Unexpected rate limit script result: {result_str}")
