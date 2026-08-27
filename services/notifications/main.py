@@ -17,12 +17,12 @@ Supervision:
 
 import asyncio
 import json
-import logging
 import os
 
 from aiokafka import AIOKafkaConsumer
+from shared.logger import get_logger
 
-logger = logging.getLogger("payflow.notifications")
+logger = get_logger("notification")
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
 
@@ -60,23 +60,23 @@ def _send_notification(event: dict) -> None:
 
     if event_type == "PAYMENT_SUCCESS":
         amount = payload.get('amount', '?')
-        logger.info("📱 SMS ALERT [%s]: Your payment of ₹%s was successful!", txn_id, amount)
+        logger.info(f"📱 SMS ALERT [{txn_id}]: Your payment of ₹{amount} was successful!", extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_PROCESSED"})
 
     elif event_type == "PAYMENT_FAILED":
         reason = payload.get('reason', 'unknown')
-        logger.info("⚠️ SMS ALERT [%s]: Your payment failed. Reason: %s", txn_id, reason)
+        logger.info(f"⚠️ SMS ALERT [{txn_id}]: Your payment failed. Reason: {reason}", extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_PROCESSED"})
 
     elif event_type == "PAYMENT_COMPENSATED":
         reason = payload.get('reason', 'unknown')
-        logger.info("🔄 SMS ALERT [%s]: Your payment was reversed and you have been refunded. Reason: %s", txn_id, reason)
+        logger.info(f"🔄 SMS ALERT [{txn_id}]: Your payment was reversed and you have been refunded. Reason: {reason}", extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_PROCESSED"})
 
     elif event_type == "PAYMENT_INDETERMINATE":
-        logger.warning("🚨 ALERT [%s]: Payment state is unclear. Please contact support.", txn_id)
+        logger.warning(f"🚨 ALERT [{txn_id}]: Payment state is unclear. Please contact support.", extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_PROCESSED"})
 
     elif event_type == "COMPENSATION_FAILED":
         logger.error(
-            "🚨 CRITICAL ALERT [%s]: Payment failed AND refund failed. Sender=%s Amount=%s. MANUAL INTERVENTION REQUIRED.",
-            txn_id, payload.get('sender'), payload.get('amount')
+            f"🚨 CRITICAL ALERT [{txn_id}]: Payment failed AND refund failed. Sender={payload.get('sender')} Amount={payload.get('amount')}. MANUAL INTERVENTION REQUIRED.",
+            extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_PROCESSED"}
         )
     # We deliberately skip PAYMENT_INITIATED to avoid spamming the user
     # before the payment is confirmed.
@@ -94,7 +94,7 @@ async def consume_events() -> None:
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     await consumer.start()
-    logger.info("Notification consumer started.")
+    logger.info("Notification consumer started.", extra={"event": "CONSUMER_STARTED"})
     try:
         async for msg in consumer:
             event = msg.value
@@ -103,7 +103,7 @@ async def consume_events() -> None:
 
             # Idempotency check: skip if we already notified for this (txn_id, event_type)
             if _is_duplicate(txn_id, event_type):
-                logger.debug("Skipping duplicate notification: txn_id=%s event=%s", txn_id, event_type)
+                logger.debug("Skipping duplicate notification", extra={"txn_id": txn_id, "event": "NOTIFICATION_DUPLICATE_SKIPPED"})
                 continue
 
             try:
@@ -112,11 +112,10 @@ async def consume_events() -> None:
             except Exception as e:
                 # Notification delivery failure: log and continue.
                 # We do NOT retry indefinitely — a failed SMS alert is not worth
-                # blocking Kafka partition progress.
-                logger.error("Notification delivery failed for txn_id=%s event=%s: %s", txn_id, event_type, e)
+                logger.error("Notification delivery failed", extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_ERROR"}, exc_info=True)
     finally:
         await consumer.stop()
-        logger.info("Notification consumer stopped.")
+        logger.info("Notification consumer stopped.", extra={"event": "CONSUMER_STOPPED"})
 
 
 async def _supervised_consumer() -> None:
@@ -141,5 +140,4 @@ async def start_notification_worker():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(start_notification_worker())

@@ -6,7 +6,9 @@ import os
 import uuid
 from decimal import Decimal
 from typing import Optional
+from shared.logger import get_logger
 
+logger = get_logger("bank_hdfc")
 app = FastAPI(title="HDFC Bank Service")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@localhost:5432/db_bank_hdfc")
 
@@ -67,6 +69,7 @@ async def debit_account(payload: TransactionPayload):
     balance is NOT debited a second time.
     """
     op = payload.operation_type or "DEBIT"
+    logger.info("Received debit request", extra={"txn_id": payload.txn_id, "event": "DEBIT_REQUEST_RECEIVED", "amount": float(payload.amount), "vpa": payload.vpa})
 
     async with app.state.pool.acquire() as connection:
         # First: check whether this operation was already processed.
@@ -81,11 +84,13 @@ async def debit_account(payload: TransactionPayload):
             account = await connection.fetchrow(
                 "SELECT balance FROM accounts WHERE vpa = $1", payload.vpa
             )
-            return {
+            result = {
                 "status": "SUCCESS",
                 "new_balance": float(account['balance']) if account else None,
                 "idempotent": True,  # signals to caller this was a duplicate
             }
+            logger.info("Debit request already processed", extra={"txn_id": payload.txn_id, "event": "DEBIT_IDEMPOTENT_HIT"})
+            return result
 
         async with connection.transaction():
             # SELECT FOR UPDATE: serialises concurrent debits on the same account.
@@ -96,8 +101,10 @@ async def debit_account(payload: TransactionPayload):
             )
 
             if not account:
+                logger.warning("Account not found", extra={"txn_id": payload.txn_id, "event": "DEBIT_FAILED", "reason": "Account not found"})
                 raise HTTPException(status_code=404, detail="Account not found")
             if account['balance'] < payload.amount:
+                logger.warning("Insufficient funds", extra={"txn_id": payload.txn_id, "event": "DEBIT_FAILED", "reason": "Insufficient funds"})
                 raise HTTPException(status_code=400, detail="Insufficient funds")
 
             new_balance = account['balance'] - payload.amount
@@ -112,9 +119,10 @@ async def debit_account(payload: TransactionPayload):
             )
             if not inserted:
                 # Lost race to a concurrent identical request: roll back this
-                # transaction, fetch balance, and return success.
+                logger.warning("Lost race to concurrent request", extra={"txn_id": payload.txn_id, "event": "DEBIT_CONCURRENT_RACE_LOST"})
                 raise asyncpg.exceptions.RaiseError("concurrent_duplicate")
 
+            logger.info("Debit successful", extra={"txn_id": payload.txn_id, "event": "DEBIT_COMMITTED"})
             return {"status": "SUCCESS", "new_balance": float(new_balance)}
 
 # ---------------------------------------------------------------------------
@@ -134,6 +142,7 @@ async def credit_account(payload: TransactionPayload):
     the credit is NOT applied a second time.
     """
     op = payload.operation_type or "CREDIT"
+    logger.info("Received credit request", extra={"txn_id": payload.txn_id, "event": "CREDIT_REQUEST_RECEIVED", "amount": float(payload.amount), "vpa": payload.vpa, "operation_type": op})
 
     async with app.state.pool.acquire() as connection:
         # Pre-check for existing record before acquiring the row lock
@@ -145,17 +154,20 @@ async def credit_account(payload: TransactionPayload):
             account = await connection.fetchrow(
                 "SELECT balance FROM accounts WHERE vpa = $1", payload.vpa
             )
-            return {
+            result = {
                 "status": "SUCCESS",
                 "new_balance": float(account['balance']) if account else None,
                 "idempotent": True,
             }
+            logger.info("Credit request already processed", extra={"txn_id": payload.txn_id, "event": "CREDIT_IDEMPOTENT_HIT"})
+            return result
 
         async with connection.transaction():
             account = await connection.fetchrow(
                 "SELECT balance FROM accounts WHERE vpa = $1 FOR UPDATE", payload.vpa
             )
             if not account:
+                logger.warning("Account not found", extra={"txn_id": payload.txn_id, "event": "CREDIT_FAILED", "reason": "Account not found"})
                 raise HTTPException(status_code=404, detail="Account not found")
 
             new_balance = account['balance'] + payload.amount
@@ -167,8 +179,10 @@ async def credit_account(payload: TransactionPayload):
                 connection, payload.txn_id, op, payload.vpa, payload.amount
             )
             if not inserted:
+                logger.warning("Lost race to concurrent request", extra={"txn_id": payload.txn_id, "event": "CREDIT_CONCURRENT_RACE_LOST"})
                 raise asyncpg.exceptions.RaiseError("concurrent_duplicate")
 
+            logger.info("Credit successful", extra={"txn_id": payload.txn_id, "event": "CREDIT_COMMITTED"})
             return {"status": "SUCCESS", "new_balance": float(new_balance)}
 
 # ---------------------------------------------------------------------------

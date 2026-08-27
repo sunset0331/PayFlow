@@ -8,7 +8,7 @@ import asyncpg
 import asyncio
 import os
 import json
-import logging
+from shared.logger import get_logger
 from typing import Optional
 
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
@@ -19,6 +19,8 @@ from shared.redis_client import get_redis
 from shared.kafka_client import start_kafka_producer, stop_kafka_producer, publish_event
 from shared.rate_limiter import enforce_rate_limits
 from services.gateway.recovery import run_recovery_worker
+
+logger = get_logger("gateway")
 
 app = FastAPI(title="PayFlow UPI Gateway")
 
@@ -91,7 +93,6 @@ async def startup_event():
 
 async def _supervised_recovery_worker(db_pool) -> None:
     """Wraps run_recovery_worker with a restart loop so a crash doesn't kill recovery permanently."""
-    logger = logging.getLogger("payflow.gateway")
     while True:
         try:
             await run_recovery_worker(db_pool, BANK_URLS, publish_event)
@@ -372,6 +373,11 @@ async def initiate_payment(
         # ----------------------------------------------------------------
         await _saga_create(txn_id, payload.sender_vpa, payload.receiver_vpa, payload.amount, idemp_key)
 
+        logger.info(
+            f"Payment initiated for {payload.amount} from {payload.sender_vpa} to {payload.receiver_vpa}",
+            extra={"txn_id": txn_id, "event": "PAYMENT_INITIATED"}
+        )
+
         await publish_event("payment_events", txn_id, "PAYMENT_INITIATED", {
             "amount": payload.amount,
             "sender": payload.sender_vpa,
@@ -395,19 +401,23 @@ async def initiate_payment(
                 )
                 debit_res.raise_for_status()
                 await _saga_update(txn_id, "DEBIT_COMPLETED")
+                logger.info("Debit completed successfully", extra={"txn_id": txn_id, "event": "DEBIT_COMPLETED"})
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 400:
                     await _saga_update(txn_id, "FAILED", "Insufficient funds")
+                    logger.warning("Debit failed: Insufficient funds", extra={"txn_id": txn_id, "event": "PAYMENT_FAILED"})
                     await publish_event("payment_events", txn_id, "PAYMENT_FAILED", {"reason": "Insufficient funds"})
                     raise HTTPException(status_code=400, detail="Insufficient funds")
 
                 await _saga_update(txn_id, "FAILED", "Sender bank returned error")
+                logger.error("Debit failed: Sender bank returned error", extra={"txn_id": txn_id, "event": "PAYMENT_FAILED"}, exc_info=True)
                 await publish_event("payment_events", txn_id, "PAYMENT_FAILED", {"reason": "Sender bank unavailable"})
                 raise HTTPException(status_code=502, detail="Sender bank unavailable")
 
-            except httpx.RequestError:
+            except httpx.RequestError as e:
                 await _saga_update(txn_id, "FAILED", "Sender bank unreachable")
+                logger.error("Debit failed: Sender bank unreachable", extra={"txn_id": txn_id, "event": "PAYMENT_FAILED"}, exc_info=True)
                 await publish_event("payment_events", txn_id, "PAYMENT_FAILED", {"reason": "Sender bank unreachable"})
                 raise HTTPException(status_code=502, detail="Sender bank unreachable")
 
@@ -429,8 +439,10 @@ async def initiate_payment(
                 )
                 credit_res.raise_for_status()
                 credit_confirmed = True
+                logger.info("Credit completed successfully", extra={"txn_id": txn_id, "event": "CREDIT_COMPLETED"})
 
-            except (httpx.HTTPStatusError, httpx.RequestError):
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                logger.warning("Credit failed or timed out. Querying bank.", extra={"txn_id": txn_id, "event": "CREDIT_NETWORK_FAILURE"}, exc_info=True)
                 # Credit failed or timed out. Query the bank before compensating.
                 credit_status = await _query_bank_transaction(
                     client, receiver_url, txn_id, "CREDIT"
@@ -462,6 +474,7 @@ async def initiate_payment(
                 # SUCCESS
                 # ----------------------------------------------------------------
                 await _saga_update(txn_id, "COMPLETED")
+                logger.info("Payment fully completed", extra={"txn_id": txn_id, "event": "PAYMENT_SUCCESS"})
                 await publish_event("payment_events", txn_id, "PAYMENT_SUCCESS", {"status": "completed"})
                 payflow_transactions_total.labels(status='success').inc()
 
@@ -494,6 +507,7 @@ async def initiate_payment(
 
             if comp_success:
                 await _saga_update(txn_id, "COMPENSATED")
+                logger.info("Compensation successful. Sender refunded.", extra={"txn_id": txn_id, "event": "PAYMENT_COMPENSATED"})
                 payflow_compensations_total.labels(outcome='success').inc()
                 await publish_event("payment_events", txn_id, "PAYMENT_COMPENSATED", {
                     "reason": "Receiver credit failed, sender refunded"

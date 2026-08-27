@@ -6,9 +6,9 @@ import json
 import uuid
 import hashlib
 import os
-import logging
+from shared.logger import get_logger
 
-logger = logging.getLogger("payflow.ledger")
+logger = get_logger("ledger")
 
 app = FastAPI(title="Ledger Service")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@127.0.0.1:5433/db_ledger")
@@ -43,7 +43,7 @@ async def _process_event(conn, event: dict) -> None:
         ON CONFLICT (event_id) DO NOTHING
     """, event_id, uuid.UUID(event['txn_id']), event['event_type'], json.dumps(event['payload']))
 
-    logger.info("[Ledger] Recorded: %s -> %s", event['txn_id'], event['event_type'])
+    logger.info("Ledger entry written", extra={"txn_id": event['txn_id'], "event": "LEDGER_ENTRY_WRITTEN", "event_type": event['event_type']})
 
 
 async def consume_events() -> None:
@@ -52,7 +52,7 @@ async def consume_events() -> None:
       - Idempotent event processing (ON CONFLICT DO NOTHING)
       - Per-message retry (up to MAX_RETRIES_PER_MESSAGE)
       - Dead-letter handling for poison messages
-      - Structured logging (replaces bare print())
+      - Structured logging (JSON format)
 
     Auto-commit is enabled (aiokafka default). Since we use ON CONFLICT DO NOTHING,
     reprocessing after a crash is safe — the ledger entry already exists.
@@ -65,7 +65,7 @@ async def consume_events() -> None:
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     await consumer.start()
-    logger.info("Ledger consumer started.")
+    logger.info("Ledger consumer started.", extra={"event": "CONSUMER_STARTED"})
     try:
         async for msg in consumer:
             event = msg.value
@@ -80,8 +80,10 @@ async def consume_events() -> None:
                     if retries > MAX_RETRIES_PER_MESSAGE:
                         # Poison message: move to DLQ, commit offset, continue
                         logger.error(
-                            "[Ledger] DLQ: txn_id=%s event_type=%s after %d retries. Error: %s",
-                            event.get('txn_id'), event.get('event_type'), MAX_RETRIES_PER_MESSAGE, e
+                            "Moved message to DLQ after %d retries",
+                            MAX_RETRIES_PER_MESSAGE,
+                            extra={"txn_id": event.get('txn_id'), "event": "LEDGER_DLQ_ROUTED", "event_type": event.get('event_type')},
+                            exc_info=True
                         )
                         _dlq.append({
                             "partition": msg.partition,
@@ -92,8 +94,9 @@ async def consume_events() -> None:
                     else:
                         wait = 2 ** retries  # exponential backoff: 2s, 4s, 8s
                         logger.warning(
-                            "[Ledger] Retry %d/%d for txn_id=%s in %ds. Error: %s",
-                            retries, MAX_RETRIES_PER_MESSAGE, event.get('txn_id'), wait, e
+                            "Retrying message",
+                            extra={"txn_id": event.get('txn_id'), "event": "LEDGER_RETRY", "retry_count": retries, "wait_seconds": wait},
+                            exc_info=True
                         )
                         await asyncio.sleep(wait)
     finally:
