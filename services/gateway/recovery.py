@@ -129,10 +129,11 @@ async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
             """
             SELECT txn_id, sender_vpa, receiver_vpa, amount, state
             FROM saga_transactions
-            WHERE state IN ('DEBIT_PENDING', 'CREDIT_PENDING', 'COMPENSATING')
+            WHERE state IN ('DEBIT_PENDING', 'DEBIT_COMPLETED', 'CREDIT_PENDING', 'COMPENSATING')
               AND updated_at < NOW() - INTERVAL '%s seconds'
             ORDER BY updated_at ASC
             LIMIT 50
+            FOR UPDATE SKIP LOCKED
             """ % SAGA_STALE_THRESHOLD_SECONDS
         )
 
@@ -159,6 +160,11 @@ async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
             if state == "DEBIT_PENDING":
                 await _recover_debit_pending(
                     txn_id, sender_url, sender_vpa, amount, db_pool, kafka_publish_fn
+                )
+
+            elif state == "DEBIT_COMPLETED":
+                await _recover_debit_completed(
+                    txn_id, sender_url, sender_vpa, receiver_url, receiver_vpa, amount, db_pool, kafka_publish_fn
                 )
 
             elif state == "CREDIT_PENDING":
@@ -214,6 +220,60 @@ async def _recover_debit_pending(
     else:
         # Bank unreachable — leave for next cycle, bump updated_at to avoid busy-loop
         logger.warning("Recovery: txn_id=%s DEBIT state unknown, bank unreachable. Retrying next cycle.", txn_id)
+
+
+async def _recover_debit_completed(
+    txn_id: str, sender_url: str, sender_vpa: str,
+    receiver_url: str, receiver_vpa: str, amount: float, db_pool, kafka_publish_fn
+) -> None:
+    """
+    DEBIT_COMPLETED: debit succeeded, but we crashed before sending the CREDIT.
+    (Or maybe we sent it but crashed before CREDIT_PENDING transition).
+    """
+    if not receiver_url:
+        logger.warning("No URL for receiver bank in txn_id=%s — skipping.", txn_id)
+        return
+
+    credit_status = await _query_bank(receiver_url, txn_id, "CREDIT")
+
+    if credit_status is True:
+        # Credit completed — we sent it but crashed before state update
+        logger.info("Recovery: txn_id=%s CREDIT confirmed completed. Marking COMPLETED.", txn_id)
+        await _update_saga(db_pool, txn_id, "COMPLETED")
+        await kafka_publish_fn("payment_events", txn_id, "PAYMENT_SUCCESS",
+                               {"status": "completed", "recovered": True})
+
+    elif credit_status is False:
+        # Credit not executed — we need to send it now
+        logger.info("Recovery: txn_id=%s CREDIT not executed. Sending credit now.", txn_id)
+        
+        # Advance to CREDIT_PENDING so next cycle will handle it properly if we crash during HTTP
+        await _update_saga(db_pool, txn_id, "CREDIT_PENDING")
+        
+        try:
+            async with httpx.AsyncClient(timeout=BANK_QUERY_TIMEOUT_SECONDS) as client:
+                resp = await client.post(
+                    f"{receiver_url}/credit",
+                    json={
+                        "vpa": receiver_vpa,
+                        "amount": amount,
+                        "txn_id": txn_id,
+                        "operation_type": "CREDIT",
+                    },
+                )
+                resp.raise_for_status()
+                
+            logger.info("Recovery: txn_id=%s CREDIT successful. Marking COMPLETED.", txn_id)
+            await _update_saga(db_pool, txn_id, "COMPLETED")
+            await kafka_publish_fn("payment_events", txn_id, "PAYMENT_SUCCESS",
+                                   {"status": "completed", "recovered": True})
+                                   
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            logger.warning("Recovery: txn_id=%s CREDIT attempt failed (%s). Leaving for next cycle.", txn_id, e)
+
+    else:
+        # Receiver bank unreachable
+        logger.warning("Recovery: txn_id=%s CREDIT state unknown, bank unreachable. Retrying next cycle.", txn_id)
 
 
 async def _recover_credit_pending(
