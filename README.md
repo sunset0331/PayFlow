@@ -47,6 +47,12 @@ User
 
 **Sliding Window Rate Limiter:** Protects the gateway using Redis sorted sets (ZSET) to enforce strict per-minute and per-hour transaction limits per user with <2ms overhead.
 
+**Crash Recovery Worker:** A background asyncio worker in the gateway polls for stuck Sagas (e.g., from network failures or process crashes) using `FOR UPDATE SKIP LOCKED` and correctly advances or compensates their state by querying the banks.
+
+**Distributed Tracing (Structured Logging):** Implements centralized JSON logging across all 5 services using `ServiceLoggerAdapter`. Automatically extracts and propagates a `txn_id` across HTTP and Kafka boundaries for clean observability.
+
+**Expanded Prometheus Metrics:** Comprehensive `/metrics` endpoints instrumented across all services tracking service-level latencies and counters with bounded-cardinality safety (no user-specific labels).
+
 ## Project Structure
 
 ```plaintext
