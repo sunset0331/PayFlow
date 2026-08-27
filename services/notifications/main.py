@@ -1,29 +1,145 @@
-import asyncio
-from aiokafka import AIOKafkaConsumer
-import json
+"""
+PayFlow Notification Service.
 
-async def start_notification_worker():
+Consumes payment_events from Kafka and sends user-facing alerts (SMS/email).
+
+Idempotency:
+  Uses an in-memory seen-set keyed by (txn_id, event_type).
+  This prevents sending duplicate notifications if Kafka redelivers a message.
+
+  For production: replace _seen_notifications with a Redis SET or a
+  'notification_dedup' DB table with TTL, so the dedup survives restarts.
+
+Supervision:
+  The consumer runs in a supervised loop — if it crashes (Kafka broker
+  temporarily unavailable), it restarts automatically after a backoff.
+"""
+
+import asyncio
+import json
+import logging
+import os
+
+from aiokafka import AIOKafkaConsumer
+
+logger = logging.getLogger("payflow.notifications")
+
+KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
+
+# In-memory deduplication set: (txn_id, event_type) pairs we've already notified about.
+# Bounded to avoid unbounded memory growth — evict oldest entries when over limit.
+MAX_DEDUP_SET_SIZE = 100_000
+_seen_notifications: set = set()
+
+
+def _is_duplicate(txn_id: str, event_type: str) -> bool:
+    """Check if we've already sent a notification for this (txn_id, event_type)."""
+    return (txn_id, event_type) in _seen_notifications
+
+
+def _mark_seen(txn_id: str, event_type: str) -> None:
+    """Record that we've sent a notification for this (txn_id, event_type)."""
+    if len(_seen_notifications) >= MAX_DEDUP_SET_SIZE:
+        # Simple eviction: clear oldest half (production should use a proper TTL cache)
+        entries = list(_seen_notifications)
+        _seen_notifications.clear()
+        _seen_notifications.update(entries[len(entries) // 2:])
+    _seen_notifications.add((txn_id, event_type))
+
+
+def _send_notification(event: dict) -> None:
+    """
+    Deliver the user-facing notification.
+
+    In production, replace the print() statements with actual SMS/push/email
+    API calls (e.g. Twilio, Firebase FCM, SendGrid).
+    """
+    event_type = event.get('event_type')
+    txn_id = event.get('txn_id')
+    payload = event.get('payload', {})
+
+    if event_type == "PAYMENT_SUCCESS":
+        amount = payload.get('amount', '?')
+        logger.info("📱 SMS ALERT [%s]: Your payment of ₹%s was successful!", txn_id, amount)
+
+    elif event_type == "PAYMENT_FAILED":
+        reason = payload.get('reason', 'unknown')
+        logger.info("⚠️ SMS ALERT [%s]: Your payment failed. Reason: %s", txn_id, reason)
+
+    elif event_type == "PAYMENT_COMPENSATED":
+        reason = payload.get('reason', 'unknown')
+        logger.info("🔄 SMS ALERT [%s]: Your payment was reversed and you have been refunded. Reason: %s", txn_id, reason)
+
+    elif event_type == "PAYMENT_INDETERMINATE":
+        logger.warning("🚨 ALERT [%s]: Payment state is unclear. Please contact support.", txn_id)
+
+    elif event_type == "COMPENSATION_FAILED":
+        logger.error(
+            "🚨 CRITICAL ALERT [%s]: Payment failed AND refund failed. Sender=%s Amount=%s. MANUAL INTERVENTION REQUIRED.",
+            txn_id, payload.get('sender'), payload.get('amount')
+        )
+    # We deliberately skip PAYMENT_INITIATED to avoid spamming the user
+    # before the payment is confirmed.
+
+
+async def consume_events() -> None:
+    """
+    Kafka consumer loop with per-message idempotency deduplication and error handling.
+    """
     consumer = AIOKafkaConsumer(
         "payment_events",
-        bootstrap_servers="127.0.0.1:9092",
-        group_id="notification-group", # DIFFERENT group id than the Ledger!
+        bootstrap_servers=KAFKA_BROKER,
+        group_id="notification-group",  # Different group_id from ledger — independent offset tracking
         auto_offset_reset="earliest",
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     await consumer.start()
-    print("Notification Service listening for events...")
+    logger.info("Notification consumer started.")
     try:
         async for msg in consumer:
             event = msg.value
-            event_type = event['event_type']
-            
-            if event_type == "PAYMENT_SUCCESS":
-                print(f"📱 SMS ALERT: Payment {event['txn_id']} successful!")
-            elif event_type in ["PAYMENT_FAILED", "PAYMENT_COMPENSATED"]:
-                print(f"⚠️ SMS ALERT: Payment {event['txn_id']} failed. Reason: {event['payload'].get('reason')}")
-            # We ignore PAYMENT_INITIATED for SMS to avoid spamming the user
+            txn_id = event.get('txn_id', '')
+            event_type = event.get('event_type', '')
+
+            # Idempotency check: skip if we already notified for this (txn_id, event_type)
+            if _is_duplicate(txn_id, event_type):
+                logger.debug("Skipping duplicate notification: txn_id=%s event=%s", txn_id, event_type)
+                continue
+
+            try:
+                _send_notification(event)
+                _mark_seen(txn_id, event_type)
+            except Exception as e:
+                # Notification delivery failure: log and continue.
+                # We do NOT retry indefinitely — a failed SMS alert is not worth
+                # blocking Kafka partition progress.
+                logger.error("Notification delivery failed for txn_id=%s event=%s: %s", txn_id, event_type, e)
     finally:
         await consumer.stop()
+        logger.info("Notification consumer stopped.")
+
+
+async def _supervised_consumer() -> None:
+    """
+    Wraps consume_events() with a supervised restart loop.
+    Restarts automatically after any crash (e.g. Kafka broker unavailable).
+    """
+    while True:
+        try:
+            await consume_events()
+        except asyncio.CancelledError:
+            logger.info("Notification consumer task cancelled. Shutting down.")
+            break
+        except Exception as e:
+            logger.error("Notification consumer crashed, restarting in 5s: %s", e, exc_info=True)
+            await asyncio.sleep(5)
+
+
+async def start_notification_worker():
+    """Start the notification worker (supervised). Called by the process entry-point."""
+    await _supervised_consumer()
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(start_notification_worker())
