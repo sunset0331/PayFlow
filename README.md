@@ -161,3 +161,27 @@ curl -X POST http://127.0.0.1:8000/pay \
 
 - **Prometheus Metrics:** http://localhost:8000/metrics
 - **Grafana Dashboard:** http://localhost:3000 *(Add Prometheus as a data source at `http://prometheus:9090` to visualize P95 latency and throughput)*
+
+## Testing
+
+PayFlow includes a comprehensive `pytest` integration suite that uses `asyncio` to validate high concurrency idempotency, rate-limiting Lua scripts, Saga timeouts, and compensation logic.
+
+### 1. Setup the Test Environment
+Ensure you have activated your virtual environment:
+```bash
+source venv/bin/activate
+pip install -r requirements-test.txt  # Or manually install pytest, pytest-asyncio, respx, faker
+```
+
+### 2. Run the Test Suite
+The tests use mocked asynchronous database connections and a `FakeRedis` implementation to simulate complex distributed failures (like the "Lost Response" scenario and Chaos-injected timeouts):
+```bash
+pytest tests/ -v
+```
+
+**What is tested?**
+- **Bank Logic (`test_bank_api.py`)**: Validates Row-Level Locking (Pessimistic Concurrency) and Insufficient Funds logic.
+- **Idempotency (`test_gateway_idempotency.py`)**: Simulates 100% identical concurrent requests to guarantee they are deduplicated.
+- **Rate Limiting (`test_rate_limiter.py`)**: Tests the Sliding-Window Redis LUA scripts for velocity constraints.
+- **Saga Compensation (`test_saga_compensation.py`)**: Validates the Gateway's rollback capability if a receiver bank times out.
+- **Failure Injection (`test_failure_injection.py`)**: Chaos testing 503s and Network disconnects.
