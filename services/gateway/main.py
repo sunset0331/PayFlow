@@ -66,6 +66,9 @@ payflow_idempotency_hits_total = Counter(
     'payflow_idempotency_hits_total',
     'Duplicate requests detected and served from idempotency cache'
 )
+gateway_saga_states_total = Counter(
+    'gateway_saga_states_total', 'Saga states entered', ['state']
+)
 
 # ---------------------------------------------------------------------------
 # Models
@@ -143,6 +146,7 @@ async def _saga_update(txn_id: str, state: str, error_reason: str = None) -> Non
             """,
             state, error_reason, uuid.UUID(txn_id)
         )
+    gateway_saga_states_total.labels(state=state).inc()
 
 # ---------------------------------------------------------------------------
 # Idempotency dependency

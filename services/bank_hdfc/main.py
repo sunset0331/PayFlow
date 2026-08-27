@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import asyncpg
 import asyncpg.exceptions
@@ -11,6 +11,42 @@ from shared.logger import get_logger
 logger = get_logger("bank_hdfc")
 app = FastAPI(title="HDFC Bank Service")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@localhost:5432/db_bank_hdfc")
+
+import time
+from fastapi import Request
+from prometheus_client import Counter, Histogram, generate_latest
+from fastapi.responses import Response
+
+bank_requests_total = Counter('bank_requests_total', 'Total bank operations', ['operation', 'status'])
+bank_operation_duration_seconds = Histogram('bank_operation_duration_seconds', 'Latency of bank operations', ['operation'])
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start_time = time.time()
+    operation = request.url.path.strip("/")
+    
+    try:
+        response = await call_next(request)
+        if operation in ("debit", "credit"):
+            bank_operation_duration_seconds.labels(operation=operation).observe(time.time() - start_time)
+            if response.status_code == 404:
+                bank_requests_total.labels(operation=operation, status="account_not_found").inc()
+            elif response.status_code == 400:
+                bank_requests_total.labels(operation=operation, status="insufficient_funds").inc()
+            elif response.status_code >= 500:
+                bank_requests_total.labels(operation=operation, status="error").inc()
+        return response
+    except Exception as e:
+        if operation in ("debit", "credit"):
+            bank_operation_duration_seconds.labels(operation=operation).observe(time.time() - start_time)
+            bank_requests_total.labels(operation=operation, status="error").inc()
+        raise e
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type="text/plain")
+
+
 
 class TransactionPayload(BaseModel):
     vpa: str
@@ -90,6 +126,7 @@ async def debit_account(payload: TransactionPayload):
                 "idempotent": True,  # signals to caller this was a duplicate
             }
             logger.info("Debit request already processed", extra={"txn_id": payload.txn_id, "event": "DEBIT_IDEMPOTENT_HIT"})
+            bank_requests_total.labels(operation="debit", status="duplicate").inc()
             return result
 
         async with connection.transaction():
@@ -123,6 +160,7 @@ async def debit_account(payload: TransactionPayload):
                 raise asyncpg.exceptions.RaiseError("concurrent_duplicate")
 
             logger.info("Debit successful", extra={"txn_id": payload.txn_id, "event": "DEBIT_COMMITTED"})
+            bank_requests_total.labels(operation="debit", status="success").inc()
             return {"status": "SUCCESS", "new_balance": float(new_balance)}
 
 # ---------------------------------------------------------------------------
@@ -160,6 +198,7 @@ async def credit_account(payload: TransactionPayload):
                 "idempotent": True,
             }
             logger.info("Credit request already processed", extra={"txn_id": payload.txn_id, "event": "CREDIT_IDEMPOTENT_HIT"})
+            bank_requests_total.labels(operation="credit", status="duplicate").inc()
             return result
 
         async with connection.transaction():
@@ -183,6 +222,7 @@ async def credit_account(payload: TransactionPayload):
                 raise asyncpg.exceptions.RaiseError("concurrent_duplicate")
 
             logger.info("Credit successful", extra={"txn_id": payload.txn_id, "event": "CREDIT_COMMITTED"})
+            bank_requests_total.labels(operation="credit", status="success").inc()
             return {"status": "SUCCESS", "new_balance": float(new_balance)}
 
 # ---------------------------------------------------------------------------

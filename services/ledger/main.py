@@ -12,6 +12,20 @@ logger = get_logger("ledger")
 
 app = FastAPI(title="Ledger Service")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@127.0.0.1:5433/db_ledger")
+
+import time
+from prometheus_client import Counter, Histogram, generate_latest
+from fastapi.responses import Response
+
+ledger_events_total = Counter('ledger_events_total', 'Total ledger events processed', ['event_type', 'status'])
+ledger_dlq_total = Counter('ledger_dlq_total', 'Total messages routed to DLQ', ['reason'])
+ledger_event_processing_duration_seconds = Histogram('ledger_event_processing_duration_seconds', 'Time to process ledger events')
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type="text/plain")
+
+
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
 
 # ---------------------------------------------------------------------------
@@ -37,13 +51,18 @@ async def _process_event(conn, event: dict) -> None:
     event_id = uuid.UUID(hashlib.md5(raw_string.encode()).hexdigest())
 
     # The Ledger is APPEND ONLY. ON CONFLICT DO NOTHING handles duplicate Kafka messages.
-    await conn.execute("""
+    res = await conn.execute("""
         INSERT INTO events (event_id, txn_id, event_type, payload_json)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (event_id) DO NOTHING
     """, event_id, uuid.UUID(event['txn_id']), event['event_type'], json.dumps(event['payload']))
 
-    logger.info("Ledger entry written", extra={"txn_id": event['txn_id'], "event": "LEDGER_ENTRY_WRITTEN", "event_type": event['event_type']})
+    if res == "INSERT 0 0":
+        ledger_events_total.labels(event_type=event['event_type'], status="duplicate").inc()
+        logger.info("Ledger entry duplicate", extra={"txn_id": event['txn_id'], "event": "LEDGER_ENTRY_DUPLICATE", "event_type": event['event_type']})
+    else:
+        ledger_events_total.labels(event_type=event['event_type'], status="processed").inc()
+        logger.info("Ledger entry written", extra={"txn_id": event['txn_id'], "event": "LEDGER_ENTRY_WRITTEN", "event_type": event['event_type']})
 
 
 async def consume_events() -> None:
@@ -70,10 +89,12 @@ async def consume_events() -> None:
         async for msg in consumer:
             event = msg.value
             retries = 0
+            start_time = time.time()
             while retries <= MAX_RETRIES_PER_MESSAGE:
                 try:
                     async with app.state.pool.acquire() as conn:
                         await _process_event(conn, event)
+                    ledger_event_processing_duration_seconds.observe(time.time() - start_time)
                     break  # Success
                 except Exception as e:
                     retries += 1
@@ -85,6 +106,9 @@ async def consume_events() -> None:
                             extra={"txn_id": event.get('txn_id'), "event": "LEDGER_DLQ_ROUTED", "event_type": event.get('event_type')},
                             exc_info=True
                         )
+                        ledger_dlq_total.labels(reason="max_retries_exceeded").inc()
+                        ledger_events_total.labels(event_type=event.get('event_type', 'unknown'), status="failed").inc()
+                        ledger_event_processing_duration_seconds.observe(time.time() - start_time)
                         _dlq.append({
                             "partition": msg.partition,
                             "offset": msg.offset,

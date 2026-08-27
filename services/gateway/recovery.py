@@ -35,9 +35,15 @@ import asyncio
 import logging
 import httpx
 import uuid
+import time
+from prometheus_client import Counter, Histogram, Gauge
 from shared.logger import get_logger
 
 logger = get_logger("recovery")
+
+gateway_recovery_total = Counter('gateway_recovery_total', 'Total recovery attempts', ['status', 'saga_state'])
+gateway_recovery_duration_seconds = Histogram('gateway_recovery_duration_seconds', 'Latency of recovery scans')
+gateway_stale_sagas = Gauge('gateway_stale_sagas', 'Number of stale sagas found in the last scan')
 
 # How long a saga must be stuck before the recovery worker intervenes (seconds)
 SAGA_STALE_THRESHOLD_SECONDS = 30
@@ -137,6 +143,8 @@ async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
             """ % SAGA_STALE_THRESHOLD_SECONDS
         )
 
+    gateway_stale_sagas.set(len(stale_sagas) if stale_sagas else 0)
+
     if not stale_sagas:
         return
 
@@ -156,6 +164,7 @@ async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
 
         logger.info("Recovering saga", extra={"txn_id": txn_id, "saga_state": state, "event": "RECOVERY_INITIATED"})
 
+        start_time = time.time()
         try:
             if state == "DEBIT_PENDING":
                 await _recover_debit_pending(
@@ -178,7 +187,10 @@ async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
                 )
 
         except Exception as e:
+            gateway_recovery_total.labels(status="failed", saga_state=state).inc()
             logger.error("Recovery failed", extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"}, exc_info=True)
+        finally:
+            gateway_recovery_duration_seconds.observe(time.time() - start_time)
 
 
 async def _update_saga(db_pool, txn_id: str, state: str, error_reason: str = None) -> None:
@@ -207,18 +219,21 @@ async def _recover_debit_pending(
     if debit_status is True:
         # Debit was completed successfully before the crash
         logger.info("DEBIT confirmed completed. Advancing to DEBIT_COMPLETED.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+        gateway_recovery_total.labels(status="success", saga_state="DEBIT_PENDING").inc()
         await _update_saga(db_pool, txn_id, "DEBIT_COMPLETED")
         # Note: CREDIT_PENDING will be handled in the next scan cycle
 
     elif debit_status is False:
         # Debit was never executed — safe to mark as FAILED
         logger.info("DEBIT confirmed not executed. Marking FAILED.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+        gateway_recovery_total.labels(status="success", saga_state="DEBIT_PENDING").inc()
         await _update_saga(db_pool, txn_id, "FAILED", "Recovery: debit confirmed not executed")
         await kafka_publish_fn("payment_events", txn_id, "PAYMENT_FAILED",
                                {"reason": "Recovery: debit confirmed not executed"})
 
     else:
         # Bank unreachable — leave for next cycle, bump updated_at to avoid busy-loop
+        gateway_recovery_total.labels(status="retrying", saga_state="DEBIT_PENDING").inc()
         logger.warning("DEBIT state unknown, bank unreachable. Retrying next cycle.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
 
 
@@ -239,6 +254,7 @@ async def _recover_debit_completed(
     if credit_status is True:
         # Credit completed — we sent it but crashed before state update
         logger.info("CREDIT confirmed completed. Marking COMPLETED.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+        gateway_recovery_total.labels(status="success", saga_state="DEBIT_COMPLETED").inc()
         await _update_saga(db_pool, txn_id, "COMPLETED")
         await kafka_publish_fn("payment_events", txn_id, "PAYMENT_SUCCESS",
                                {"status": "completed", "recovered": True})
@@ -269,10 +285,12 @@ async def _recover_debit_completed(
                                    {"status": "completed", "recovered": True})
                                    
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            gateway_recovery_total.labels(status="retrying", saga_state="DEBIT_COMPLETED").inc()
             logger.warning("CREDIT attempt failed. Leaving for next cycle.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"}, exc_info=True)
 
     else:
         # Receiver bank unreachable
+        gateway_recovery_total.labels(status="retrying", saga_state="DEBIT_COMPLETED").inc()
         logger.warning("CREDIT state unknown, bank unreachable. Retrying next cycle.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
 
 
@@ -293,6 +311,7 @@ async def _recover_credit_pending(
     if credit_status is True:
         # Credit completed — this is the classic lost-response scenario
         logger.info("CREDIT confirmed completed. Marking COMPLETED.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+        gateway_recovery_total.labels(status="success", saga_state="CREDIT_PENDING").inc()
         await _update_saga(db_pool, txn_id, "COMPLETED")
         await kafka_publish_fn("payment_events", txn_id, "PAYMENT_SUCCESS",
                                {"status": "completed", "recovered": True})
@@ -306,22 +325,26 @@ async def _recover_credit_pending(
             comp_ok = await _credit_sender(sender_url, sender_vpa, amount, txn_id)
             if comp_ok:
                 logger.info("Compensation successful. Marking COMPENSATED.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+                gateway_recovery_total.labels(status="success", saga_state="CREDIT_PENDING").inc()
                 await _update_saga(db_pool, txn_id, "COMPENSATED")
                 await kafka_publish_fn("payment_events", txn_id, "PAYMENT_COMPENSATED",
                                        {"reason": "Recovery: credit not executed, sender refunded"})
             else:
                 logger.error("Compensation FAILED. Marking COMPENSATION_FAILED.", extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"})
+                gateway_recovery_total.labels(status="failed", saga_state="CREDIT_PENDING").inc()
                 await _update_saga(db_pool, txn_id, "COMPENSATION_FAILED",
                                    "Recovery: compensation attempt failed — manual intervention required")
                 await kafka_publish_fn("payment_events", txn_id, "COMPENSATION_FAILED",
                                        {"reason": "Recovery compensation failed — manual intervention required"})
         else:
             logger.error("No sender URL, cannot compensate.", extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"})
+            gateway_recovery_total.labels(status="failed", saga_state="CREDIT_PENDING").inc()
             await _update_saga(db_pool, txn_id, "COMPENSATION_FAILED",
                                "Recovery: no sender URL, cannot compensate — manual intervention required")
 
     else:
         # Receiver bank unreachable — leave for next cycle
+        gateway_recovery_total.labels(status="retrying", saga_state="CREDIT_PENDING").inc()
         logger.warning("CREDIT state unknown, bank unreachable. Retrying next cycle.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
 
 
@@ -342,6 +365,7 @@ async def _recover_compensating(
     if comp_status is True:
         # Compensation completed before the crash
         logger.info("COMPENSATION confirmed completed. Marking COMPENSATED.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+        gateway_recovery_total.labels(status="success", saga_state="COMPENSATING").inc()
         await _update_saga(db_pool, txn_id, "COMPENSATED")
         await kafka_publish_fn("payment_events", txn_id, "PAYMENT_COMPENSATED",
                                {"reason": "Recovery: compensation confirmed completed"})
@@ -352,15 +376,18 @@ async def _recover_compensating(
         comp_ok = await _credit_sender(sender_url, sender_vpa, amount, txn_id)
         if comp_ok:
             logger.info("Compensation retry successful.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
+            gateway_recovery_total.labels(status="success", saga_state="COMPENSATING").inc()
             await _update_saga(db_pool, txn_id, "COMPENSATED")
             await kafka_publish_fn("payment_events", txn_id, "PAYMENT_COMPENSATED",
                                    {"reason": "Recovery: compensation completed on retry"})
         else:
             logger.error("Compensation retry FAILED.", extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"})
+            gateway_recovery_total.labels(status="failed", saga_state="COMPENSATING").inc()
             await _update_saga(db_pool, txn_id, "COMPENSATION_FAILED",
                                "Recovery: compensation retry failed — manual intervention required")
             await kafka_publish_fn("payment_events", txn_id, "COMPENSATION_FAILED",
                                    {"reason": "Recovery compensation retry failed"})
 
     else:
+        gateway_recovery_total.labels(status="retrying", saga_state="COMPENSATING").inc()
         logger.warning("COMPENSATION state unknown. Retrying next cycle.", extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})

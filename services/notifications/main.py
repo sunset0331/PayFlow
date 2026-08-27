@@ -18,11 +18,21 @@ Supervision:
 import asyncio
 import json
 import os
+import time
 
 from aiokafka import AIOKafkaConsumer
+from prometheus_client import Counter, Histogram, start_http_server
 from shared.logger import get_logger
 
 logger = get_logger("notification")
+
+# Prometheus Metrics
+notification_events_total = Counter(
+    'notification_events_total', 'Total notification events processed', ['event_type', 'status']
+)
+notification_processing_duration_seconds = Histogram(
+    'notification_processing_duration_seconds', 'Time to process notification events'
+)
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
 
@@ -102,17 +112,24 @@ async def consume_events() -> None:
             event_type = event.get('event_type', '')
 
             # Idempotency check: skip if we already notified for this (txn_id, event_type)
+            start_time = time.time()
             if _is_duplicate(txn_id, event_type):
                 logger.debug("Skipping duplicate notification", extra={"txn_id": txn_id, "event": "NOTIFICATION_DUPLICATE_SKIPPED"})
+                notification_events_total.labels(event_type=event_type, status="duplicate").inc()
+                notification_processing_duration_seconds.observe(time.time() - start_time)
                 continue
 
             try:
                 _send_notification(event)
                 _mark_seen(txn_id, event_type)
+                notification_events_total.labels(event_type=event_type, status="processed").inc()
             except Exception as e:
                 # Notification delivery failure: log and continue.
                 # We do NOT retry indefinitely — a failed SMS alert is not worth
                 logger.error("Notification delivery failed", extra={"txn_id": txn_id, "event_type": event_type, "event": "NOTIFICATION_ERROR"}, exc_info=True)
+                notification_events_total.labels(event_type=event_type, status="failed").inc()
+            finally:
+                notification_processing_duration_seconds.observe(time.time() - start_time)
     finally:
         await consumer.stop()
         logger.info("Notification consumer stopped.", extra={"event": "CONSUMER_STOPPED"})
@@ -136,6 +153,8 @@ async def _supervised_consumer() -> None:
 
 async def start_notification_worker():
     """Start the notification worker (supervised). Called by the process entry-point."""
+    start_http_server(8004)
+    logger.info("Started Prometheus metrics server on port 8004")
     await _supervised_consumer()
 
 
