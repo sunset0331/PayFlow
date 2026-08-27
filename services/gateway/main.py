@@ -5,8 +5,10 @@ from datetime import datetime
 import httpx
 import uuid
 import asyncpg
+import asyncio
 import os
 import json
+import logging
 from typing import Optional
 
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
@@ -16,6 +18,7 @@ import time
 from shared.redis_client import get_redis
 from shared.kafka_client import start_kafka_producer, stop_kafka_producer, publish_event
 from shared.rate_limiter import enforce_rate_limits
+from services.gateway.recovery import run_recovery_worker
 
 app = FastAPI(title="PayFlow UPI Gateway")
 
@@ -77,13 +80,37 @@ class PaymentRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Start Kafka producer and connect to db_gateway on startup."""
+    """Start Kafka producer, connect to db_gateway, and launch recovery worker."""
     await start_kafka_producer()
     app.state.db_pool = await asyncpg.create_pool(GATEWAY_DB_URL, min_size=2, max_size=10)
+    # Launch the crash recovery worker as a supervised background task.
+    # If it crashes, it logs the error but does not take down the gateway.
+    app.state.recovery_task = asyncio.create_task(
+        _supervised_recovery_worker(app.state.db_pool)
+    )
+
+async def _supervised_recovery_worker(db_pool) -> None:
+    """Wraps run_recovery_worker with a restart loop so a crash doesn't kill recovery permanently."""
+    logger = logging.getLogger("payflow.gateway")
+    while True:
+        try:
+            await run_recovery_worker(db_pool, BANK_URLS, publish_event)
+        except asyncio.CancelledError:
+            logger.info("Recovery worker cancelled. Shutting down.")
+            break
+        except Exception as e:
+            logger.error("Recovery worker crashed, restarting in 10s: %s", e, exc_info=True)
+            await asyncio.sleep(10)
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Gracefully close Kafka producer and database pool."""
+    """Gracefully close Kafka producer, recovery worker, and database pool."""
+    if hasattr(app.state, 'recovery_task') and app.state.recovery_task:
+        app.state.recovery_task.cancel()
+        try:
+            await app.state.recovery_task
+        except asyncio.CancelledError:
+            pass
     await stop_kafka_producer()
     if app.state.db_pool:
         await app.state.db_pool.close()
