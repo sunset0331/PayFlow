@@ -10,16 +10,13 @@ from shared.logger import get_logger
 
 logger = get_logger("bank_hdfc")
 app = FastAPI(title="HDFC Bank Service")
-DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@localhost:5432/db_bank_hdfc")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_bank_hdfc")
 
 import time
 from fastapi import Request
 from prometheus_client import Counter, Histogram, generate_latest
 from fastapi.responses import Response
-
-bank_requests_total = Counter('bank_requests_total', 'Total bank operations', ['operation', 'status'])
-bank_operation_duration_seconds = Histogram('bank_operation_duration_seconds', 'Latency of bank operations', ['operation'])
-
+from shared.bank_metrics import bank_requests_total, bank_operation_duration_seconds
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start_time = time.time()
@@ -56,10 +53,57 @@ class TransactionPayload(BaseModel):
     # Defaults preserve backward compatibility if caller omits the field.
     operation_type: Optional[str] = None  # will be overridden per endpoint
 
+class AccountPayload(BaseModel):
+    vpa: str
+    user_name: str
+    initial_balance: Decimal = Decimal("0.00")
+
 @app.on_event("startup")
 async def startup():
     # Connection pooling prevents opening a new TCP connection to Postgres per request
     app.state.pool = await asyncpg.create_pool(DB_URL, min_size=5, max_size=20)
+
+# ---------------------------------------------------------------------------
+# Account Management Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/accounts")
+async def create_account(payload: AccountPayload):
+    """Create a new account in this bank."""
+    logger.info("Creating new account", extra={"vpa": payload.vpa, "event": "ACCOUNT_CREATION_REQUEST"})
+    async with app.state.pool.acquire() as connection:
+        try:
+            account_id = str(uuid.uuid4())
+            await connection.execute(
+                """
+                INSERT INTO accounts (account_id, vpa, balance, user_name, status)
+                VALUES ($1, $2, $3, $4, 'ACTIVE')
+                """,
+                uuid.UUID(account_id), payload.vpa, payload.initial_balance, payload.user_name
+            )
+            logger.info("Account created successfully", extra={"vpa": payload.vpa, "event": "ACCOUNT_CREATED"})
+            return {"status": "SUCCESS", "account_id": account_id, "vpa": payload.vpa}
+        except asyncpg.exceptions.UniqueViolationError:
+            logger.warning("Account creation failed: VPA already exists", extra={"vpa": payload.vpa, "event": "ACCOUNT_CREATION_FAILED"})
+            raise HTTPException(status_code=409, detail="VPA already exists")
+
+@app.get("/accounts/{vpa}")
+async def get_account(vpa: str):
+    """Retrieve account details."""
+    async with app.state.pool.acquire() as connection:
+        account = await connection.fetchrow(
+            "SELECT account_id, vpa, balance, user_name, status, created_at FROM accounts WHERE vpa = $1", vpa
+        )
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return {
+            "account_id": str(account['account_id']),
+            "vpa": account['vpa'],
+            "balance": float(account['balance']),
+            "user_name": account['user_name'],
+            "status": account['status'],
+            "created_at": account['created_at'].isoformat()
+        }
 
 # ---------------------------------------------------------------------------
 # Internal helper: idempotent transaction record

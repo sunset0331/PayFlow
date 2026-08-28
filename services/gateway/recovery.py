@@ -36,6 +36,8 @@ import logging
 import httpx
 import uuid
 import time
+import os
+from typing import Optional
 from prometheus_client import Counter, Histogram, Gauge
 from shared.logger import get_logger
 
@@ -46,7 +48,7 @@ gateway_recovery_duration_seconds = Histogram('gateway_recovery_duration_seconds
 gateway_stale_sagas = Gauge('gateway_stale_sagas', 'Number of stale sagas found in the last scan')
 
 # How long a saga must be stuck before the recovery worker intervenes (seconds)
-SAGA_STALE_THRESHOLD_SECONDS = 30
+SAGA_STALE_THRESHOLD_SECONDS = 120
 
 # How often to run the recovery scan (seconds)
 RECOVERY_POLL_INTERVAL_SECONDS = 15
@@ -107,28 +109,27 @@ async def _credit_sender(
         return False
 
 
-async def run_recovery_worker(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
+async def run_recovery_worker(db_pool, kafka_publish_fn) -> None:
     """
     Main recovery loop. Runs indefinitely; designed to be started as an
     asyncio background task inside the Gateway process.
 
     Args:
         db_pool: asyncpg connection pool for db_gateway
-        bank_urls: dict mapping bank name -> base URL (e.g. {'hdfc': 'http://...'})
         kafka_publish_fn: async function to publish Kafka events
     """
     logger.info("Recovery worker started. Polling every %ds for stale sagas.", RECOVERY_POLL_INTERVAL_SECONDS)
 
     while True:
         try:
-            await _recovery_scan(db_pool, bank_urls, kafka_publish_fn)
+            await _recovery_scan(db_pool, kafka_publish_fn)
         except Exception as e:
             logger.error("Recovery worker scan failed: %s", e, exc_info=True)
         finally:
             await asyncio.sleep(RECOVERY_POLL_INTERVAL_SECONDS)
 
 
-async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
+async def _recovery_scan(db_pool, kafka_publish_fn) -> None:
     """Single scan of stale sagas."""
     async with db_pool.acquire() as conn:
         stale_sagas = await conn.fetch(
@@ -159,8 +160,20 @@ async def _recovery_scan(db_pool, bank_urls: dict, kafka_publish_fn) -> None:
 
         sender_bank = sender_vpa.split("@")[1]
         receiver_bank = receiver_vpa.split("@")[1]
-        sender_url = bank_urls.get(sender_bank)
-        receiver_url = bank_urls.get(receiver_bank)
+        
+        # Hardcoded fallback for tests and docker networking
+        BANK_URLS_FALLBACK = {
+            "hdfc": os.getenv("HDFC_BANK_URL", "http://bank-hdfc:8001"),
+            "sbi": os.getenv("SBI_BANK_URL", "http://bank-sbi:8002")
+        }
+
+        # Resolve sender URL
+        sender_row = await conn.fetchrow("SELECT bank_service_url FROM vpa_registry WHERE vpa = $1", sender_vpa)
+        sender_url = sender_row["bank_service_url"] if sender_row else BANK_URLS_FALLBACK.get(sender_bank)
+
+        # Resolve receiver URL
+        receiver_row = await conn.fetchrow("SELECT bank_service_url FROM vpa_registry WHERE vpa = $1", receiver_vpa)
+        receiver_url = receiver_row["bank_service_url"] if receiver_row else BANK_URLS_FALLBACK.get(receiver_bank)
 
         logger.info("Recovering saga", extra={"txn_id": txn_id, "saga_state": state, "event": "RECOVERY_INITIATED"})
 

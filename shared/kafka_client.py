@@ -2,7 +2,7 @@ from aiokafka import AIOKafkaProducer
 import json
 import os
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
 
 # Global producer instance
 producer: AIOKafkaProducer = None

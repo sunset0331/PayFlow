@@ -14,8 +14,13 @@ CREATE TABLE accounts (
     vpa VARCHAR(255) UNIQUE NOT NULL,
     balance DECIMAL(12, 2) NOT NULL CHECK (balance >= 0),
     user_name VARCHAR(255) NOT NULL,
-    status VARCHAR(50) DEFAULT 'ACTIVE'
+    status VARCHAR(50) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+INSERT INTO accounts (account_id, vpa, balance, user_name) VALUES 
+('11111111-1111-1111-1111-111111111111', 'utkarsh@hdfc', 50000.0, 'Utkarsh'),
+('11111111-1111-1111-1111-222222222222', 'sender@hdfc', 50000.0, 'Sender');
 
 -- id is the surrogate PK; (txn_id, operation_type) enforces idempotency.
 -- A debit, credit, or compensation for the same txn_id can each exist once.
@@ -36,8 +41,13 @@ CREATE TABLE accounts (
     vpa VARCHAR(255) UNIQUE NOT NULL,
     balance DECIMAL(12, 2) NOT NULL CHECK (balance >= 0),
     user_name VARCHAR(255) NOT NULL,
-    status VARCHAR(50) DEFAULT 'ACTIVE'
+    status VARCHAR(50) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+INSERT INTO accounts (account_id, vpa, balance, user_name) VALUES 
+('22222222-2222-2222-2222-111111111111', 'alice@sbi', 1000.0, 'Alice'),
+('22222222-2222-2222-2222-222222222222', 'receiver@sbi', 1000.0, 'Receiver');
 
 -- Same idempotency-safe schema as db_bank_hdfc.
 CREATE TABLE transactions (
@@ -58,6 +68,12 @@ CREATE TABLE vpa_registry (
     account_id UUID NOT NULL,
     is_active BOOLEAN DEFAULT TRUE
 );
+
+INSERT INTO vpa_registry (vpa, bank_service_url, account_id) VALUES 
+('utkarsh@hdfc', 'http://bank-hdfc:8001', '11111111-1111-1111-1111-111111111111'),
+('sender@hdfc', 'http://bank-hdfc:8001', '11111111-1111-1111-1111-222222222222'),
+('alice@sbi', 'http://bank-sbi:8002', '22222222-2222-2222-2222-111111111111'),
+('receiver@sbi', 'http://bank-sbi:8002', '22222222-2222-2222-2222-222222222222');
 
 -- Durable saga state for each payment transaction.
 -- The gateway persists state at every step so crashes can be recovered.
@@ -83,6 +99,16 @@ CREATE TABLE saga_transactions (
     error_reason    TEXT,
     created_at      TIMESTAMP DEFAULT NOW(),
     updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE outbox_events (
+    id BIGSERIAL PRIMARY KEY,
+    txn_id UUID NOT NULL,
+    topic VARCHAR(255) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMP
 );
 
 -- Index for the recovery worker: find stale in-progress sagas efficiently

@@ -1,8 +1,19 @@
 global:
-  scrape_interval: 5s # Fast scraping for local testing
+  scrape_interval: 5s
 
 scrape_configs:
   - job_name: 'payflow_gateway'
-    # For Mac + Docker, host.docker.internal routes to your local machine
     static_configs:
-      - targets: ['host.docker.internal:8000']
+      - targets: ['gateway:8000']
+  - job_name: 'bank_hdfc'
+    static_configs:
+      - targets: ['bank-hdfc:8001']
+  - job_name: 'bank_sbi'
+    static_configs:
+      - targets: ['bank-sbi:8002']
+  - job_name: 'ledger'
+    static_configs:
+      - targets: ['ledger:8003']
+  - job_name: 'notifications'
+    static_configs:
+      - targets: ['notifications:8004']
