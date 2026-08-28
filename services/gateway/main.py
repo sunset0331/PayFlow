@@ -361,56 +361,14 @@ async def metrics():
     return Response(content=generate_latest(), media_type="text/plain")
 
 # ---------------------------------------------------------------------------
-# Compensation helpers
+# Compensation helpers (REMOVED - Now handled by Orchestrator)
 # ---------------------------------------------------------------------------
-
-async def _query_bank_transaction(
-    client: httpx.AsyncClient,
-    bank_url: str,
-    txn_id: str,
-    operation: str,
-) -> bool | None:
-    try:
-        resp = await client.get(
-            f"{bank_url}/transaction/{txn_id}",
-            params={"operation": operation},
-        )
-        if resp.status_code == 200:
-            return True
-        if resp.status_code == 404:
-            return False
-        return None
-    except (httpx.RequestError, httpx.HTTPStatusError):
-        return None
-
-
-async def _execute_compensation(
-    client: httpx.AsyncClient,
-    sender_url: str,
-    sender_vpa: str,
-    amount: float,
-    txn_id: str,
-) -> bool:
-    try:
-        comp_res = await client.post(
-            f"{sender_url}/credit",
-            json={
-                "vpa": sender_vpa,
-                "amount": amount,
-                "txn_id": txn_id,
-                "operation_type": "COMPENSATION",
-            },
-        )
-        comp_res.raise_for_status()
-        return True
-    except (httpx.HTTPStatusError, httpx.RequestError):
-        return False
 
 # ---------------------------------------------------------------------------
 # Payment endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/pay")
+@app.post("/pay", status_code=202)
 async def initiate_payment(
     payload: PaymentRequest,
     idemp_result: tuple = Depends(check_idempotency),
@@ -443,167 +401,52 @@ async def initiate_payment(
             raise e
 
         # ----------------------------------------------------------------
-        # DURABLE SAGA CREATION
+        # ASYNC SAGA CREATION (OUTBOX PATTERN)
         # ----------------------------------------------------------------
-        await _saga_create(txn_id, payload.sender_vpa, payload.receiver_vpa, payload.amount, idemp_key)
-
-        logger.info(
-            f"Payment initiated for {payload.amount} from {payload.sender_vpa} to {payload.receiver_vpa}",
-            extra={"txn_id": txn_id, "event": "PAYMENT_INITIATED"}
+        await _saga_create(
+            txn_id, payload.sender_vpa, payload.receiver_vpa, payload.amount, idemp_key,
+            [
+                {
+                    "topic": "payment_events",
+                    "event_type": "PAYMENT_INITIATED",
+                    "payload": {
+                        "amount": payload.amount,
+                        "sender": payload.sender_vpa,
+                        "receiver": payload.receiver_vpa
+                    }
+                }
+            ]
         )
-
-        await publish_event("payment_events", txn_id, "PAYMENT_INITIATED", {
-            "amount": payload.amount,
-            "sender": payload.sender_vpa,
-            "receiver": payload.receiver_vpa
-        })
-
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            # ----------------------------------------------------------------
-            # SAGA STEP 1: DEBIT SENDER
-            # ----------------------------------------------------------------
-            await _saga_update(txn_id, "DEBIT_PENDING")
-            try:
-                debit_res = await client.post(
-                    f"{sender_url}/debit",
-                    json={
+        
+        # Advance state to DEBIT_PENDING and dispatch command to payment worker
+        await _saga_update(
+            txn_id, "DEBIT_PENDING", None,
+            [
+                {
+                    "topic": "payment.commands",
+                    "event_type": "debit_request",
+                    "payload": {
                         "vpa": payload.sender_vpa,
                         "amount": payload.amount,
-                        "txn_id": txn_id,
-                        "operation_type": "DEBIT",
+                        "bank_url": sender_url
                     }
-                )
-                debit_res.raise_for_status()
-                await _saga_update(txn_id, "DEBIT_COMPLETED")
-                logger.info("Debit completed successfully", extra={"txn_id": txn_id, "event": "DEBIT_COMPLETED"})
-
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 400:
-                    await _saga_update(txn_id, "FAILED", "Insufficient funds")
-                    logger.warning("Debit failed: Insufficient funds", extra={"txn_id": txn_id, "event": "PAYMENT_FAILED"})
-                    await publish_event("payment_events", txn_id, "PAYMENT_FAILED", {"reason": "Insufficient funds"})
-                    raise HTTPException(status_code=400, detail="Insufficient funds")
-
-                await _saga_update(txn_id, "FAILED", "Sender bank returned error")
-                logger.error("Debit failed: Sender bank returned error", extra={"txn_id": txn_id, "event": "PAYMENT_FAILED"}, exc_info=True)
-                await publish_event("payment_events", txn_id, "PAYMENT_FAILED", {"reason": "Sender bank unavailable"})
-                raise HTTPException(status_code=502, detail="Sender bank unavailable")
-
-            except httpx.RequestError as e:
-                await _saga_update(txn_id, "FAILED", "Sender bank unreachable")
-                logger.error("Debit failed: Sender bank unreachable", extra={"txn_id": txn_id, "event": "PAYMENT_FAILED"}, exc_info=True)
-                await publish_event("payment_events", txn_id, "PAYMENT_FAILED", {"reason": "Sender bank unreachable"})
-                raise HTTPException(status_code=502, detail="Sender bank unreachable")
-
-            # ----------------------------------------------------------------
-            # SAGA STEP 2: CREDIT RECEIVER
-            # ----------------------------------------------------------------
-            await _saga_update(txn_id, "CREDIT_PENDING")
-            credit_confirmed = False
-
-            try:
-                credit_res = await client.post(
-                    f"{receiver_url}/credit",
-                    json={
-                        "vpa": payload.receiver_vpa,
-                        "amount": payload.amount,
-                        "txn_id": txn_id,
-                        "operation_type": "CREDIT",
-                    }
-                )
-                credit_res.raise_for_status()
-                credit_confirmed = True
-                logger.info("Credit completed successfully", extra={"txn_id": txn_id, "event": "CREDIT_COMPLETED"})
-
-            except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                logger.warning("Credit failed or timed out. Querying bank.", extra={"txn_id": txn_id, "event": "CREDIT_NETWORK_FAILURE"}, exc_info=True)
-                # Credit failed or timed out. Query the bank before compensating.
-                credit_status = await _query_bank_transaction(
-                    client, receiver_url, txn_id, "CREDIT"
-                )
-
-                if credit_status is True:
-                    # Lost response: credit succeeded, network dropped the reply.
-                    credit_confirmed = True
-                    payflow_lost_response_recoveries_total.inc()
-
-                elif credit_status is False:
-                    # Confirmed not executed: safe to compensate.
-                    pass
-
-                else:
-                    # Outcome unknown: do NOT compensate.
-                    await _saga_update(txn_id, "INDETERMINATE",
-                        "Credit outcome unknown after receiver bank query failure")
-                    await publish_event("payment_events", txn_id, "PAYMENT_INDETERMINATE", {
-                        "reason": "Credit outcome unknown after receiver bank query failure",
-                    })
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Payment state is indeterminate. Do not retry without manual review."
-                    )
-
-            if credit_confirmed:
-                # ----------------------------------------------------------------
-                # SUCCESS
-                # ----------------------------------------------------------------
-                await _saga_update(txn_id, "COMPLETED")
-                logger.info("Payment fully completed", extra={"txn_id": txn_id, "event": "PAYMENT_SUCCESS"})
-                await publish_event("payment_events", txn_id, "PAYMENT_SUCCESS", {"status": "completed"})
-                payflow_transactions_total.labels(status='success').inc()
-
-                success_response = {
-                    "status": "SUCCESS",
-                    "txn_id": txn_id,
-                    "message": f"Successfully transferred ₹{payload.amount}",
-                    "idempotency_key": idemp_key
                 }
-                # Cache the successful result so future duplicates get the same response
-                try:
-                    await redis_conn.set(
-                        f"idemp:{idemp_key}",
-                        json.dumps(success_response),
-                        ex=IDEMP_TTL_SECONDS
-                    )
-                except Exception:
-                    pass  # Cache write failure is non-fatal for a completed payment
+            ]
+        )
 
-                return success_response
+        logger.info(
+            f"Payment initiated asynchronously for {payload.amount} from {payload.sender_vpa} to {payload.receiver_vpa}",
+            extra={"txn_id": txn_id, "event": "PAYMENT_INITIATED_ASYNC"}
+        )
 
-            # ----------------------------------------------------------------
-            # SAGA STEP 3: COMPENSATION
-            # Credit confirmed not executed; refund sender.
-            # ----------------------------------------------------------------
-            await _saga_update(txn_id, "COMPENSATING", "Receiver credit failed")
-            comp_success = await _execute_compensation(
-                client, sender_url, payload.sender_vpa, payload.amount, txn_id
-            )
-
-            if comp_success:
-                await _saga_update(txn_id, "COMPENSATED")
-                logger.info("Compensation successful. Sender refunded.", extra={"txn_id": txn_id, "event": "PAYMENT_COMPENSATED"})
-                payflow_compensations_total.labels(outcome='success').inc()
-                await publish_event("payment_events", txn_id, "PAYMENT_COMPENSATED", {
-                    "reason": "Receiver credit failed, sender refunded"
-                })
-                raise HTTPException(
-                    status_code=500,
-                    detail="Receiver bank failed. Payment reversed and sender refunded."
-                )
-            else:
-                await _saga_update(txn_id, "COMPENSATION_FAILED",
-                    "Both credit and compensation failed — manual intervention required")
-                payflow_compensations_total.labels(outcome='failed').inc()
-                await publish_event("payment_events", txn_id, "COMPENSATION_FAILED", {
-                    "reason": "Both credit and compensation failed",
-                    "sender": payload.sender_vpa,
-                    "receiver": payload.receiver_vpa,
-                    "amount": payload.amount,
-                })
-                raise HTTPException(
-                    status_code=500,
-                    detail="Critical: payment reversal also failed. Manual intervention required."
-                )
+        # We don't cache 202 Accepted in Redis for idempotency because the status will change.
+        # Idempotency middleware handles "PROCESSING" locking.
+        
+        return {
+            "status": "PROCESSING",
+            "txn_id": txn_id,
+            "message": "Payment initiated and is processing in the background."
+        }
 
     except HTTPException as e:
         payflow_transactions_total.labels(status='failed').inc()
@@ -614,8 +457,23 @@ async def initiate_payment(
         raise e
 
     finally:
-        # Always measure latency and free up the active request gauge.
-        # The finally block guarantees this runs even if the request crashes halfway through.
         duration = time.time() - start_time
         payflow_transaction_duration_seconds.observe(duration)
         payflow_active_requests.dec()
+
+@app.get("/pay/{txn_id}")
+async def get_payment_status(txn_id: str):
+    """Poll for the status of a payment."""
+    async with app.state.db_pool.acquire() as conn:
+        saga = await conn.fetchrow(
+            "SELECT state, error_reason FROM saga_transactions WHERE txn_id = $1",
+            uuid.UUID(txn_id)
+        )
+        if not saga:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+            
+        return {
+            "txn_id": txn_id,
+            "status": saga["state"],
+            "error_reason": saga["error_reason"]
+        }
