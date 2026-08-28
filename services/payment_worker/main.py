@@ -1,9 +1,9 @@
 """
 Payment Worker
 
-Consumes commands from the 'payment.commands' Kafka topic,
+Consumes commands from the 'payment_commands' Kafka topic,
 executes HTTP calls to the bank APIs, and publishes results
-to the 'payment.events' Kafka topic.
+to the 'payment_events' Kafka topic.
 """
 
 import asyncio
@@ -124,7 +124,7 @@ async def _publish_event(producer: AIOKafkaProducer, txn_id: str, event_type: st
         "payload": payload
     }
     await producer.send_and_wait(
-        topic="payment.events",
+        topic="payment_events",
         value=event,
         key=txn_id.encode('utf-8')
     )
@@ -139,7 +139,7 @@ async def main():
     await producer.start()
 
     consumer = AIOKafkaConsumer(
-        "payment.commands",
+        "payment_commands",
         bootstrap_servers=KAFKA_BROKER,
         group_id="payment-worker-group",
         auto_offset_reset="earliest",
@@ -148,7 +148,7 @@ async def main():
     )
     await consumer.start()
     
-    logger.info("Payment Worker listening on 'payment.commands'")
+    logger.info("Payment Worker listening on 'payment_commands'")
     
     try:
         async for msg in consumer:

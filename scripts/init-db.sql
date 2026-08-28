@@ -14,7 +14,8 @@ CREATE TABLE accounts (
     vpa VARCHAR(255) UNIQUE NOT NULL,
     balance DECIMAL(12, 2) NOT NULL CHECK (balance >= 0),
     user_name VARCHAR(255) NOT NULL,
-    status VARCHAR(50) DEFAULT 'ACTIVE'
+    status VARCHAR(50) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 INSERT INTO accounts (account_id, vpa, balance, user_name) VALUES 
@@ -40,7 +41,8 @@ CREATE TABLE accounts (
     vpa VARCHAR(255) UNIQUE NOT NULL,
     balance DECIMAL(12, 2) NOT NULL CHECK (balance >= 0),
     user_name VARCHAR(255) NOT NULL,
-    status VARCHAR(50) DEFAULT 'ACTIVE'
+    status VARCHAR(50) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 INSERT INTO accounts (account_id, vpa, balance, user_name) VALUES 

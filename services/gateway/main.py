@@ -423,7 +423,7 @@ async def initiate_payment(
             txn_id, "DEBIT_PENDING", None,
             [
                 {
-                    "topic": "payment.commands",
+                    "topic": "payment_commands",
                     "event_type": "debit_request",
                     "payload": {
                         "vpa": payload.sender_vpa,

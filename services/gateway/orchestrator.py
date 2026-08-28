@@ -1,9 +1,9 @@
 """
 Saga Orchestrator for PayFlow Gateway.
 
-This module consumes events from the 'payment.events' Kafka topic,
+This module consumes events from the 'payment_events' Kafka topic,
 updates the saga_transactions state in PostgreSQL, and generates new commands
-to be published to 'payment.commands' via the Outbox table.
+to be published to 'payment_commands' via the Outbox table.
 """
 
 import asyncio
@@ -18,10 +18,10 @@ KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
 
 async def run_orchestrator(db_pool) -> None:
     """Main orchestrator consumer loop."""
-    logger.info("Gateway Orchestrator started. Listening to 'payment.events'.")
+    logger.info("Gateway Orchestrator started. Listening to 'payment_events'.")
 
     consumer = AIOKafkaConsumer(
-        "payment.events",
+        "payment_events",
         bootstrap_servers=KAFKA_BROKER,
         group_id="gateway-orchestrator-group",
         auto_offset_reset="earliest",
@@ -76,7 +76,7 @@ async def _process_event(db_pool, event: dict):
                 conn, txn_id, "CREDIT_PENDING", None,
                 [
                     {
-                        "topic": "payment.commands",
+                        "topic": "payment_commands",
                         "event_type": "credit_request",
                         "payload": {
                             "vpa": receiver_vpa,
@@ -124,7 +124,7 @@ async def _process_event(db_pool, event: dict):
                 conn, txn_id, "COMPENSATING", payload.get("reason", "Receiver credit failed"),
                 [
                     {
-                        "topic": "payment.commands",
+                        "topic": "payment_commands",
                         "event_type": "compensate_request",
                         "payload": {
                             "vpa": sender_vpa,
