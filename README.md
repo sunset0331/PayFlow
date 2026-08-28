@@ -23,10 +23,15 @@ User
                          │      │
                          │      └── 2. Publish Result ──> [ Apache Kafka: payment.events ]
                          │                                     │
-         ┌───────────────────────────────┴───────────────────────────────┐
-         ▼                               ▼                               ▼
-  [ Gateway Orchestrator ]        [ Ledger Service ]              [ Notification Worker ]
-  (Advances Saga State)           (Consumer Group A)              (Consumer Group B)
+          ┌───────────────────────────────┴───────────────────────────────┐
+          ▼                               ▼                               ▼
+   [ Gateway Orchestrator ]        [ Ledger Service ]              [ Notification Worker ]
+   (Advances Saga State)           (Consumer Group A)              (Consumer Group B)
+          │
+          │ (Periodic background check)
+          ▼
+   [ Reconciliation Worker ] ──(Compares)──> [ Bank Databases ]
+   (Flags DB discrepancies)  ──(Compares)──> [ Ledger Database ]
 ```
 
 ## Tech Stack
@@ -55,6 +60,8 @@ User
 **Distributed Tracing (Structured Logging):** Implements centralized JSON logging across all 5 services using `ServiceLoggerAdapter`. Automatically extracts and propagates a `txn_id` across HTTP and Kafka boundaries for clean observability.
 
 **Expanded Prometheus Metrics:** Comprehensive `/metrics` endpoints instrumented across all services tracking service-level latencies and counters with bounded-cardinality safety (no user-specific labels).
+
+**Automated Reconciliation System:** A separate periodic background worker that safely queries terminal Sagastates, Bank APIs, and the Ledger DB using `FOR UPDATE SKIP LOCKED` to cross-reference transactions and reliably flag discrepancies or missing credits across the distributed microservices.
 
 ## Project Structure
 
