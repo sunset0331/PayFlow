@@ -1,12 +1,12 @@
 import logging
 import json
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_obj = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "level": record.levelname,
             "service": getattr(record, "service", "unknown"),
             "message": record.getMessage(),
