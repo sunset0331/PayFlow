@@ -12,18 +12,21 @@ User
  ▼
 [ API Gateway (FastAPI) ] ──(Rate Limit & Idempotency)──> [ Redis ]
  │
- ├── 1. Debit Request (HTTP) ──> [ Bank A Service ] ──> [ PostgreSQL: db_bank_hdfc ]
+ ├── [ PostgreSQL: db_gateway ] (Outbox Table)
  │
- ├── 2. Credit Request (HTTP) ──> [ Bank B Service ] ──> [ PostgreSQL: db_bank_sbi ]
- │
- └── 3. Publish Event (Async) ──> [ Apache Kafka ]
-                                       │
-       ┌───────────────────────────────┴───────────────────────────────┐
-       ▼                                                               ▼
-[ Ledger Service ]                                            [ Notification Worker ]
-(Consumer Group A)                                            (Consumer Group B)
-       │                                                               │
-[ PostgreSQL: db_ledger ]                                       (Console SMS Alert)
+ └── (Async Poller) ──> [ Apache Kafka: payment.commands ]
+                               │
+                               ▼
+                        [ Payment Worker ]
+                         │      │
+                         │      ├── 1. Debit/Credit Request (HTTP) ──> [ Bank Services ]
+                         │      │
+                         │      └── 2. Publish Result ──> [ Apache Kafka: payment.events ]
+                         │                                     │
+         ┌───────────────────────────────┴───────────────────────────────┐
+         ▼                               ▼                               ▼
+  [ Gateway Orchestrator ]        [ Ledger Service ]              [ Notification Worker ]
+  (Advances Saga State)           (Consumer Group A)              (Consumer Group B)
 ```
 
 ## Tech Stack

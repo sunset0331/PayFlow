@@ -128,6 +128,15 @@ services:
     networks:
       - payflow_net
 
+  payment-worker:
+    build: .
+    command: python -m services.payment_worker.main
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - payflow_net
+
   # Monitoring Infrastructure
   nginx:
     image: nginx:alpine
