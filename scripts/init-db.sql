@@ -99,6 +99,16 @@ CREATE TABLE saga_transactions (
     updated_at      TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE outbox_events (
+    id BIGSERIAL PRIMARY KEY,
+    txn_id UUID NOT NULL,
+    topic VARCHAR(255) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMP
+);
+
 -- Index for the recovery worker: find stale in-progress sagas efficiently
 CREATE INDEX idx_saga_state_updated
     ON saga_transactions (state, updated_at)

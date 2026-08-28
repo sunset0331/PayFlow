@@ -19,6 +19,7 @@ from shared.redis_client import get_redis
 from shared.kafka_client import start_kafka_producer, stop_kafka_producer, publish_event
 from shared.rate_limiter import enforce_rate_limits
 from services.gateway.recovery import run_recovery_worker
+from services.gateway.outbox import run_outbox_publisher
 
 logger = get_logger("gateway")
 
@@ -128,6 +129,23 @@ async def startup_event():
     app.state.recovery_task = asyncio.create_task(
         _supervised_recovery_worker(app.state.db_pool)
     )
+    
+    # Launch the outbox publisher background task
+    app.state.outbox_task = asyncio.create_task(
+        _supervised_outbox_worker(app.state.db_pool)
+    )
+
+async def _supervised_outbox_worker(db_pool) -> None:
+    """Wraps run_outbox_publisher with a restart loop."""
+    while True:
+        try:
+            await run_outbox_publisher(db_pool, publish_event)
+        except asyncio.CancelledError:
+            logger.info("Outbox worker cancelled. Shutting down.")
+            break
+        except Exception as e:
+            logger.error("Outbox worker crashed, restarting in 5s: %s", e, exc_info=True)
+            await asyncio.sleep(5)
 
 async def _supervised_recovery_worker(db_pool) -> None:
     """Wraps run_recovery_worker with a restart loop so a crash doesn't kill recovery permanently."""
@@ -144,13 +162,21 @@ async def _supervised_recovery_worker(db_pool) -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Gracefully close Kafka producer, recovery worker, and database pool."""
+    """Gracefully close Kafka producer, recovery/outbox workers, and database pool."""
     if hasattr(app.state, 'recovery_task') and app.state.recovery_task:
         app.state.recovery_task.cancel()
         try:
             await app.state.recovery_task
         except asyncio.CancelledError:
             pass
+
+    if hasattr(app.state, 'outbox_task') and app.state.outbox_task:
+        app.state.outbox_task.cancel()
+        try:
+            await app.state.outbox_task
+        except asyncio.CancelledError:
+            pass
+
     await stop_kafka_producer()
     if app.state.db_pool:
         await app.state.db_pool.close()
@@ -159,29 +185,49 @@ async def shutdown_event():
 # Saga state helpers
 # ---------------------------------------------------------------------------
 
-async def _saga_create(txn_id: str, sender_vpa: str, receiver_vpa: str, amount: float, idempotency_key: str) -> None:
-    """Persist a new saga in INITIATED state."""
+async def _saga_create(txn_id: str, sender_vpa: str, receiver_vpa: str, amount: float, idempotency_key: str, outbox_events: list = None) -> None:
+    """Persist a new saga in INITIATED state and append to outbox transactionally."""
     async with app.state.db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO saga_transactions
-                (txn_id, sender_vpa, receiver_vpa, amount, state, idempotency_key)
-            VALUES ($1, $2, $3, $4, 'INITIATED', $5)
-            """,
-            uuid.UUID(txn_id), sender_vpa, receiver_vpa, amount, idempotency_key
-        )
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO saga_transactions
+                    (txn_id, sender_vpa, receiver_vpa, amount, state, idempotency_key)
+                VALUES ($1, $2, $3, $4, 'INITIATED', $5)
+                """,
+                uuid.UUID(txn_id), sender_vpa, receiver_vpa, amount, idempotency_key
+            )
+            if outbox_events:
+                for ev in outbox_events:
+                    await conn.execute(
+                        """
+                        INSERT INTO outbox_events (txn_id, topic, event_type, payload)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        uuid.UUID(txn_id), ev["topic"], ev["event_type"], json.dumps(ev["payload"])
+                    )
 
-async def _saga_update(txn_id: str, state: str, error_reason: str = None) -> None:
-    """Advance the saga to a new state, always updating the updated_at timestamp."""
+async def _saga_update(txn_id: str, state: str, error_reason: str = None, outbox_events: list = None) -> None:
+    """Advance the saga to a new state and append to outbox transactionally."""
     async with app.state.db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE saga_transactions
-            SET state = $1, error_reason = $2, updated_at = NOW()
-            WHERE txn_id = $3
-            """,
-            state, error_reason, uuid.UUID(txn_id)
-        )
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE saga_transactions
+                SET state = $1, error_reason = $2, updated_at = NOW()
+                WHERE txn_id = $3
+                """,
+                state, error_reason, uuid.UUID(txn_id)
+            )
+            if outbox_events:
+                for ev in outbox_events:
+                    await conn.execute(
+                        """
+                        INSERT INTO outbox_events (txn_id, topic, event_type, payload)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        uuid.UUID(txn_id), ev["topic"], ev["event_type"], json.dumps(ev["payload"])
+                    )
     gateway_saga_states_total.labels(state=state).inc()
 
 async def _get_routing_url(vpa: str) -> str:
