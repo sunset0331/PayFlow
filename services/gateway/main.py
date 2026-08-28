@@ -31,6 +31,17 @@ async def lifespan(app: FastAPI):
     await start_kafka_producer()
     app.state.db_pool = await asyncpg.create_pool(GATEWAY_DB_URL, min_size=2, max_size=10)
     
+    # Initialize admin audit log table
+    async with app.state.db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                txn_id UUID,
+                action VARCHAR,
+                result VARCHAR,
+                timestamp TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        
     # Launch background tasks
     app.state.recovery_task = asyncio.create_task(_supervised_recovery_worker(app.state.db_pool))
     app.state.outbox_task = asyncio.create_task(_supervised_outbox_worker(app.state.db_pool))
@@ -59,12 +70,18 @@ app = FastAPI(title="PayFlow UPI Gateway", lifespan=lifespan)
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_DB_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://payflow_admin:secretpassword@postgres:5432/db_gateway"
-)
+GATEWAY_DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_gateway")
 
-# Hardcoded service registry for local testing (Nginx will handle this in prod)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+def verify_admin_token(x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token")):
+    if not ADMIN_TOKEN:
+        logger.warning("Admin API accessed but ADMIN_TOKEN not configured")
+        raise HTTPException(status_code=500, detail="Admin API not configured securely")
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# In real deployment, these would be discovered or configured dynamically testing (Nginx will handle this in prod)
 BANK_URLS = {
     "hdfc": os.getenv("HDFC_BANK_URL", "http://bank-hdfc:8001"),
     "sbi": os.getenv("SBI_BANK_URL", "http://bank-sbi:8002")
@@ -459,3 +476,134 @@ async def get_payment_status(txn_id: str):
             "status": saga["state"],
             "error_reason": saga["error_reason"]
         }
+
+# ---------------------------------------------------------------------------
+# Admin Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/sagas/indeterminate")
+async def list_indeterminate_sagas(token: str = Depends(verify_admin_token)):
+    """List all INDETERMINATE sagas."""
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT txn_id, sender_vpa, receiver_vpa, amount, state, updated_at, error_reason "
+            "FROM saga_transactions WHERE state = 'INDETERMINATE' ORDER BY updated_at DESC"
+        )
+        return [{"txn_id": str(r["txn_id"]), **r} for r in rows]
+
+@app.get("/admin/sagas/{txn_id}")
+async def get_admin_saga(txn_id: str, token: str = Depends(verify_admin_token)):
+    """Get full details for a specific saga."""
+    async with app.state.db_pool.acquire() as conn:
+        saga = await conn.fetchrow(
+            "SELECT * FROM saga_transactions WHERE txn_id = $1",
+            uuid.UUID(txn_id)
+        )
+        if not saga:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        return {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in saga.items()}
+
+@app.post("/admin/sagas/{txn_id}/resolve")
+async def resolve_indeterminate_saga(txn_id: str, token: str = Depends(verify_admin_token)):
+    """Safely attempt to resolve an INDETERMINATE saga by checking bank state."""
+    logger.info("Admin triggered resolution", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION"})
+    
+    async with app.state.db_pool.acquire() as conn:
+        saga = await conn.fetchrow("SELECT * FROM saga_transactions WHERE txn_id = $1", uuid.UUID(txn_id))
+        
+        if not saga:
+            raise HTTPException(status_code=404, detail="Saga not found")
+            
+        if saga["state"] != "INDETERMINATE":
+            raise HTTPException(status_code=400, detail=f"Saga is not INDETERMINATE (current state: {saga['state']})")
+            
+        sender_url = await _get_routing_url(saga["sender_vpa"])
+        receiver_url = await _get_routing_url(saga["receiver_vpa"])
+        
+        # 1. Check Debit
+        debit_status = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{sender_url}/transaction/{txn_id}", params={"operation": "DEBIT"})
+                if r.status_code == 200:
+                    debit_status = "SUCCESS"
+                elif r.status_code == 404:
+                    debit_status = "NOT_FOUND"
+                else:
+                    debit_status = "UNAVAILABLE"
+        except Exception:
+            debit_status = "UNAVAILABLE"
+            
+        if debit_status == "NOT_FOUND":
+            await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "FAILED")
+            await _update_saga_guarded(conn, txn_id, "INDETERMINATE", "FAILED", "Admin resolved: Debit not found")
+            logger.info("Admin resolved saga to FAILED", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_SUCCESS"})
+            return {"status": "resolved", "new_state": "FAILED"}
+            
+        if debit_status == "UNAVAILABLE":
+            await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "INDETERMINATE")
+            logger.info("Admin resolution failed, sender bank down", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_NOOP"})
+            return {"status": "unresolved", "new_state": "INDETERMINATE", "reason": "Sender bank unavailable"}
+            
+        # 2. Debit Succeeded. Check Credit.
+        credit_status = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{receiver_url}/transaction/{txn_id}", params={"operation": "CREDIT"})
+                if r.status_code == 200:
+                    credit_status = "SUCCESS"
+                elif r.status_code == 404:
+                    credit_status = "NOT_FOUND"
+                else:
+                    credit_status = "UNAVAILABLE"
+        except Exception:
+            credit_status = "UNAVAILABLE"
+            
+        if credit_status == "SUCCESS":
+            await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "COMPLETED")
+            await _update_saga_guarded(conn, txn_id, "INDETERMINATE", "COMPLETED", "Admin resolved: Credit confirmed")
+            logger.info("Admin resolved saga to COMPLETED", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_SUCCESS"})
+            return {"status": "resolved", "new_state": "COMPLETED"}
+            
+        if credit_status == "NOT_FOUND":
+            await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "COMPENSATING")
+            # Compensate logic
+            outbox_payload = {
+                "topic": "payment_commands",
+                "event_type": "compensate_request",
+                "payload": {
+                    "vpa": saga["sender_vpa"],
+                    "amount": float(saga["amount"]),
+                    "bank_url": sender_url
+                }
+            }
+            await _saga_update_guarded_with_outbox(
+                conn, txn_id, "INDETERMINATE", "COMPENSATING", 
+                "Admin resolved: Credit not found, compensating", [outbox_payload]
+            )
+            logger.info("Admin resolved saga to COMPENSATING", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_SUCCESS"})
+            return {"status": "resolved", "new_state": "COMPENSATING"}
+            
+        # Credit UNAVAILABLE
+        await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "INDETERMINATE")
+        logger.info("Admin resolution failed, receiver bank down", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_NOOP"})
+        return {"status": "unresolved", "new_state": "INDETERMINATE", "reason": "Receiver bank unavailable"}
+
+async def _update_saga_guarded(conn, txn_id: str, expected_state: str, new_state: str, error_reason: str):
+    await conn.execute(
+        "UPDATE saga_transactions SET state = $1, error_reason = $2, updated_at = NOW() WHERE txn_id = $3 AND state = $4",
+        new_state, error_reason, uuid.UUID(txn_id), expected_state
+    )
+    
+async def _saga_update_guarded_with_outbox(conn, txn_id: str, expected_state: str, new_state: str, error_reason: str, outbox_events: list):
+    async with conn.transaction():
+        res = await conn.execute(
+            "UPDATE saga_transactions SET state = $1, error_reason = $2, updated_at = NOW() WHERE txn_id = $3 AND state = $4",
+            new_state, error_reason, uuid.UUID(txn_id), expected_state
+        )
+        if res == "UPDATE 1":
+            for ev in outbox_events:
+                await conn.execute(
+                    "INSERT INTO outbox_events (txn_id, topic, event_type, payload) VALUES ($1, $2, $3, $4)",
+                    uuid.UUID(txn_id), ev["topic"], ev["event_type"], json.dumps(ev["payload"])
+                )
