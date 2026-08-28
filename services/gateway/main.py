@@ -21,10 +21,39 @@ from shared.rate_limiter import enforce_rate_limits
 from services.gateway.recovery import run_recovery_worker
 from services.gateway.outbox import run_outbox_publisher
 from services.gateway.orchestrator import run_orchestrator
+from contextlib import asynccontextmanager
 
 logger = get_logger("gateway")
 
-app = FastAPI(title="PayFlow UPI Gateway")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start Kafka producer, connect to db_gateway, and launch background workers."""
+    await start_kafka_producer()
+    app.state.db_pool = await asyncpg.create_pool(GATEWAY_DB_URL, min_size=2, max_size=10)
+    
+    # Launch background tasks
+    app.state.recovery_task = asyncio.create_task(_supervised_recovery_worker(app.state.db_pool))
+    app.state.outbox_task = asyncio.create_task(_supervised_outbox_worker(app.state.db_pool))
+    app.state.orchestrator_task = asyncio.create_task(_supervised_orchestrator_worker(app.state.db_pool))
+    
+    yield
+    
+    """Gracefully close Kafka producer, recovery/outbox workers, and database pool."""
+    for task_name in ['recovery_task', 'outbox_task', 'orchestrator_task']:
+        task = getattr(app.state, task_name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    
+    await stop_kafka_producer()
+    if hasattr(app.state, 'db_pool') and app.state.db_pool:
+        await app.state.db_pool.close()
+
+
+app = FastAPI(title="PayFlow UPI Gateway", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -117,29 +146,8 @@ async def get_vpa(vpa: str):
         return {"vpa": vpa, "bank_service_url": row["bank_service_url"], "is_active": row["is_active"]}
 
 # ---------------------------------------------------------------------------
-# Lifecycle
+# Lifecycle Background Tasks
 # ---------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def startup_event():
-    """Start Kafka producer, connect to db_gateway, and launch recovery worker."""
-    await start_kafka_producer()
-    app.state.db_pool = await asyncpg.create_pool(GATEWAY_DB_URL, min_size=2, max_size=10)
-    # Launch the crash recovery worker as a supervised background task.
-    # If it crashes, it logs the error but does not take down the gateway.
-    app.state.recovery_task = asyncio.create_task(
-        _supervised_recovery_worker(app.state.db_pool)
-    )
-    
-    # Launch the outbox publisher background task
-    app.state.outbox_task = asyncio.create_task(
-        _supervised_outbox_worker(app.state.db_pool)
-    )
-
-    # Launch the saga orchestrator background task
-    app.state.orchestrator_task = asyncio.create_task(
-        _supervised_orchestrator_worker(app.state.db_pool)
-    )
 
 async def _supervised_orchestrator_worker(db_pool) -> None:
     """Wraps run_orchestrator with a restart loop."""
@@ -178,33 +186,7 @@ async def _supervised_recovery_worker(db_pool) -> None:
             logger.error("Recovery worker crashed, restarting in 10s: %s", e, exc_info=True)
             await asyncio.sleep(10)
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Gracefully close Kafka producer, recovery/outbox workers, and database pool."""
-    if hasattr(app.state, 'recovery_task') and app.state.recovery_task:
-        app.state.recovery_task.cancel()
-        try:
-            await app.state.recovery_task
-        except asyncio.CancelledError:
-            pass
 
-    if hasattr(app.state, 'outbox_task') and app.state.outbox_task:
-        app.state.outbox_task.cancel()
-        try:
-            await app.state.outbox_task
-        except asyncio.CancelledError:
-            pass
-
-    if hasattr(app.state, 'orchestrator_task') and app.state.orchestrator_task:
-        app.state.orchestrator_task.cancel()
-        try:
-            await app.state.orchestrator_task
-        except asyncio.CancelledError:
-            pass
-
-    await stop_kafka_producer()
-    if app.state.db_pool:
-        await app.state.db_pool.close()
 
 # ---------------------------------------------------------------------------
 # Saga state helpers
