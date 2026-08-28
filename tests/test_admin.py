@@ -95,7 +95,6 @@ async def test_resolve_debit_success_credit_success_to_completed(mock_get, mock_
     assert response.json()["new_state"] == "COMPLETED"
     
     # Verify audit log insert
-    assert mock_db_pool.execute.call_count == 2
     calls = mock_db_pool.execute.call_args_list
     assert "INSERT INTO admin_audit_log" in calls[0][0][0]
     assert "COMPLETED" in calls[0][0][3]

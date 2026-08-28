@@ -536,7 +536,14 @@ async def resolve_indeterminate_saga(txn_id: str, token: str = Depends(verify_ad
             
         if debit_status == "NOT_FOUND":
             await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "FAILED")
-            await _update_saga_guarded(conn, txn_id, "INDETERMINATE", "FAILED", "Admin resolved: Debit not found")
+            outbox_payload = {
+                "topic": "payment_events",
+                "event_type": "PAYMENT_FAILED",
+                "payload": {"reason": "Admin resolved: Debit not found"}
+            }
+            await _saga_update_guarded_with_outbox(
+                conn, txn_id, "INDETERMINATE", "FAILED", "Admin resolved: Debit not found", [outbox_payload]
+            )
             logger.info("Admin resolved saga to FAILED", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_SUCCESS"})
             return {"status": "resolved", "new_state": "FAILED"}
             
@@ -561,7 +568,14 @@ async def resolve_indeterminate_saga(txn_id: str, token: str = Depends(verify_ad
             
         if credit_status == "SUCCESS":
             await conn.execute("INSERT INTO admin_audit_log (txn_id, action, result) VALUES ($1, $2, $3)", uuid.UUID(txn_id), "resolve", "COMPLETED")
-            await _update_saga_guarded(conn, txn_id, "INDETERMINATE", "COMPLETED", "Admin resolved: Credit confirmed")
+            outbox_payload = {
+                "topic": "payment_events",
+                "event_type": "PAYMENT_SUCCESS",
+                "payload": {"status": "completed"}
+            }
+            await _saga_update_guarded_with_outbox(
+                conn, txn_id, "INDETERMINATE", "COMPLETED", "Admin resolved: Credit confirmed", [outbox_payload]
+            )
             logger.info("Admin resolved saga to COMPLETED", extra={"txn_id": txn_id, "event": "ADMIN_RESOLUTION_SUCCESS"})
             return {"status": "resolved", "new_state": "COMPLETED"}
             

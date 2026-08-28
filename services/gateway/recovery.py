@@ -35,6 +35,7 @@ import asyncio
 import logging
 import httpx
 import uuid
+import json
 import time
 import os
 from typing import Optional
@@ -243,6 +244,24 @@ async def _update_saga_guarded(
     # asyncpg returns the command tag string e.g. "UPDATE 1" or "UPDATE 0"
     return result == "UPDATE 1"
 
+async def _saga_update_guarded_with_outbox(
+    db_pool, txn_id: str, expected_state: str, new_state: str, error_reason: str, outbox_events: list
+) -> bool:
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            res = await conn.execute(
+                "UPDATE saga_transactions SET state = $1, error_reason = $2, updated_at = NOW() WHERE txn_id = $3 AND state = $4",
+                new_state, error_reason, uuid.UUID(txn_id), expected_state
+            )
+            if res == "UPDATE 1":
+                for ev in outbox_events:
+                    await conn.execute(
+                        "INSERT INTO outbox_events (txn_id, topic, event_type, payload) VALUES ($1, $2, $3, $4)",
+                        uuid.UUID(txn_id), ev["topic"], ev["event_type"], json.dumps(ev["payload"])
+                    )
+                return True
+            return False
+
 
 async def _recover_debit_pending(
     txn_id: str, sender_url: str, sender_vpa: str, amount: float,
@@ -273,8 +292,13 @@ async def _recover_debit_pending(
 
     elif debit_status is False:
         # Debit was never executed — safe to mark FAILED.
-        advanced = await _update_saga_guarded(db_pool, txn_id, "DEBIT_PENDING", "FAILED",
-                                              "Recovery: debit confirmed not executed")
+        outbox_payload = {
+            "topic": "payment_events",
+            "event_type": "PAYMENT_FAILED",
+            "payload": {"reason": "Recovery: debit confirmed not executed"}
+        }
+        advanced = await _saga_update_guarded_with_outbox(db_pool, txn_id, "DEBIT_PENDING", "FAILED",
+                                              "Recovery: debit confirmed not executed", [outbox_payload])
         if not advanced:
             logger.info("DEBIT_PENDING→FAILED guarded update preempted — saga already advanced.",
                         extra={"txn_id": txn_id, "event": "RECOVERY_PREEMPTED"})
@@ -282,8 +306,6 @@ async def _recover_debit_pending(
         logger.info("DEBIT confirmed not executed. Marked FAILED.",
                     extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
         gateway_recovery_total.labels(status="success", saga_state="DEBIT_PENDING").inc()
-        await kafka_publish_fn("payment_events", txn_id, "PAYMENT_FAILED",
-                               {"reason": "Recovery: debit confirmed not executed"})
 
     else:
         # Bank unreachable — leave for next cycle
@@ -382,7 +404,12 @@ async def _recover_credit_pending(
     if credit_status is True:
         # Credit completed — this is the classic lost-response scenario.
         # Guard: only advance if saga is still CREDIT_PENDING.
-        advanced = await _update_saga_guarded(db_pool, txn_id, "CREDIT_PENDING", "COMPLETED")
+        outbox_payload = {
+            "topic": "payment_events",
+            "event_type": "PAYMENT_SUCCESS",
+            "payload": {"status": "completed", "recovered": True}
+        }
+        advanced = await _saga_update_guarded_with_outbox(db_pool, txn_id, "CREDIT_PENDING", "COMPLETED", None, [outbox_payload])
         if not advanced:
             logger.info("CREDIT_PENDING→COMPLETED guarded update preempted — saga already advanced.",
                         extra={"txn_id": txn_id, "event": "RECOVERY_PREEMPTED"})
@@ -390,8 +417,6 @@ async def _recover_credit_pending(
         logger.info("CREDIT confirmed completed. Marked COMPLETED.",
                     extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
         gateway_recovery_total.labels(status="success", saga_state="CREDIT_PENDING").inc()
-        await kafka_publish_fn("payment_events", txn_id, "PAYMENT_SUCCESS",
-                               {"status": "completed", "recovered": True})
 
     elif credit_status is False:
         # Credit not executed — safe to compensate.
@@ -420,23 +445,34 @@ async def _recover_credit_pending(
                 logger.info("Compensation successful. Marking COMPENSATED.",
                             extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
                 gateway_recovery_total.labels(status="success", saga_state="CREDIT_PENDING").inc()
-                await _update_saga(db_pool, txn_id, "COMPENSATED")
-                await kafka_publish_fn("payment_events", txn_id, "PAYMENT_COMPENSATED",
-                                       {"reason": "Recovery: credit not executed, sender refunded"})
+                outbox_payload = {
+                    "topic": "payment_events",
+                    "event_type": "PAYMENT_COMPENSATED",
+                    "payload": {"reason": "Recovery: credit not executed, sender refunded"}
+                }
+                await _saga_update_guarded_with_outbox(db_pool, txn_id, "COMPENSATING", "COMPENSATED", None, [outbox_payload])
             else:
                 logger.error("Compensation FAILED. Marking COMPENSATION_FAILED.",
                              extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"})
                 gateway_recovery_total.labels(status="failed", saga_state="CREDIT_PENDING").inc()
-                await _update_saga(db_pool, txn_id, "COMPENSATION_FAILED",
-                                   "Recovery: compensation attempt failed — manual intervention required")
-                await kafka_publish_fn("payment_events", txn_id, "COMPENSATION_FAILED",
-                                       {"reason": "Recovery compensation failed — manual intervention required"})
+                outbox_payload = {
+                    "topic": "payment_events",
+                    "event_type": "COMPENSATION_FAILED",
+                    "payload": {"reason": "Recovery compensation failed — manual intervention required"}
+                }
+                await _saga_update_guarded_with_outbox(db_pool, txn_id, "COMPENSATING", "COMPENSATION_FAILED",
+                                   "Recovery: compensation attempt failed — manual intervention required", [outbox_payload])
         else:
             logger.error("No sender URL, cannot compensate.",
                          extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"})
             gateway_recovery_total.labels(status="failed", saga_state="CREDIT_PENDING").inc()
-            await _update_saga(db_pool, txn_id, "COMPENSATION_FAILED",
-                               "Recovery: no sender URL, cannot compensate — manual intervention required")
+            outbox_payload = {
+                "topic": "payment_events",
+                "event_type": "COMPENSATION_FAILED",
+                "payload": {"reason": "Recovery: no sender URL, cannot compensate — manual intervention required"}
+            }
+            await _saga_update_guarded_with_outbox(db_pool, txn_id, "COMPENSATING", "COMPENSATION_FAILED",
+                               "Recovery: no sender URL, cannot compensate — manual intervention required", [outbox_payload])
 
     else:
         # Receiver bank unreachable — leave for next cycle
@@ -461,7 +497,12 @@ async def _recover_compensating(
 
     if comp_status is True:
         # Compensation completed before the crash.
-        advanced = await _update_saga_guarded(db_pool, txn_id, "COMPENSATING", "COMPENSATED")
+        outbox_payload = {
+            "topic": "payment_events",
+            "event_type": "PAYMENT_COMPENSATED",
+            "payload": {"reason": "Recovery: compensation confirmed"}
+        }
+        advanced = await _saga_update_guarded_with_outbox(db_pool, txn_id, "COMPENSATING", "COMPENSATED", None, [outbox_payload])
         if not advanced:
             logger.info("COMPENSATING→COMPENSATED guarded update preempted.",
                         extra={"txn_id": txn_id, "event": "RECOVERY_PREEMPTED"})
@@ -469,14 +510,17 @@ async def _recover_compensating(
         logger.info("COMPENSATION confirmed completed. Marked COMPENSATED.",
                     extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
         gateway_recovery_total.labels(status="success", saga_state="COMPENSATING").inc()
-        await kafka_publish_fn("payment_events", txn_id, "PAYMENT_COMPENSATED",
-                               {"reason": "Recovery: compensation confirmed completed"})
 
     elif comp_status is False:
         # Compensation not executed — retry it.
         comp_ok = await _credit_sender(sender_url, sender_vpa, amount, txn_id)
         if comp_ok:
-            advanced = await _update_saga_guarded(db_pool, txn_id, "COMPENSATING", "COMPENSATED")
+            outbox_payload = {
+                "topic": "payment_events",
+                "event_type": "PAYMENT_COMPENSATED",
+                "payload": {"reason": "Recovery: compensation completed on retry"}
+            }
+            advanced = await _saga_update_guarded_with_outbox(db_pool, txn_id, "COMPENSATING", "COMPENSATED", None, [outbox_payload])
             if not advanced:
                 logger.info("COMPENSATING→COMPENSATED guarded update preempted after retry.",
                             extra={"txn_id": txn_id, "event": "RECOVERY_PREEMPTED"})
@@ -484,16 +528,18 @@ async def _recover_compensating(
             logger.info("Compensation retry successful.",
                         extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
             gateway_recovery_total.labels(status="success", saga_state="COMPENSATING").inc()
-            await kafka_publish_fn("payment_events", txn_id, "PAYMENT_COMPENSATED",
-                                   {"reason": "Recovery: compensation completed on retry"})
+
         else:
             logger.error("Compensation retry FAILED.",
                          extra={"txn_id": txn_id, "event": "RECOVERY_ERROR"})
             gateway_recovery_total.labels(status="failed", saga_state="COMPENSATING").inc()
-            await _update_saga(db_pool, txn_id, "COMPENSATION_FAILED",
-                               "Recovery: compensation retry failed — manual intervention required")
-            await kafka_publish_fn("payment_events", txn_id, "COMPENSATION_FAILED",
-                                   {"reason": "Recovery compensation retry failed"})
+            outbox_payload = {
+                "topic": "payment_events",
+                "event_type": "COMPENSATION_FAILED",
+                "payload": {"reason": "Recovery compensation retry failed"}
+            }
+            await _saga_update_guarded_with_outbox(db_pool, txn_id, "COMPENSATING", "COMPENSATION_FAILED",
+                               "Recovery: compensation retry failed — manual intervention required", [outbox_payload])
 
     else:
         gateway_recovery_total.labels(status="retrying", saga_state="COMPENSATING").inc()

@@ -49,8 +49,8 @@ services:
   postgres:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: payflow_admin
-      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_USER: ${POSTGRES_USER:-payflow_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5433:5432"
     volumes:
@@ -93,7 +93,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - ADMIN_TOKEN=supersecretadmin
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
     depends_on:
       postgres:
         condition: service_healthy

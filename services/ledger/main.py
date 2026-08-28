@@ -51,7 +51,6 @@ KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
 # are moved to the DLQ (a local in-memory list for now; replace with a
 # Kafka DLQ topic or a DB table in production).
 MAX_RETRIES_PER_MESSAGE = 3
-_dlq: list = []  # In-memory DLQ; replace with a persistent store for production
 
 
 async def _process_event(conn, event: dict) -> None:
@@ -178,4 +177,12 @@ async def get_transaction_history(txn_id: str):
 @app.get("/ledger/dlq/peek")
 async def peek_dlq():
     """Inspect messages that failed processing and ended up in the DLQ."""
-    return {"dlq_size": len(_dlq), "messages": _dlq[-10:]}  # Return last 10 DLQ entries
+    async with app.state.db_pool.acquire() as conn:
+        count = await conn.fetchval("SELECT count(*) FROM dead_letter_queue")
+        records = await conn.fetch("SELECT * FROM dead_letter_queue ORDER BY created_at DESC LIMIT 10")
+        import json
+        messages = [
+            {"id": r["id"], "topic": r["topic"], "payload": json.loads(r["payload"]), "error_reason": r["error_reason"], "created_at": r["created_at"]}
+            for r in records
+        ]
+        return {"dlq_size": count, "messages": messages}

@@ -21,18 +21,7 @@ RETRY_BACKOFF_SECONDS = 1  # sleep(attempt * RETRY_BACKOFF_SECONDS) between retr
 
 # In-memory Dead Letter Queue: events that exhausted all retries.
 # Each entry: {"event": ..., "error": ..., "partition": ..., "offset": ...}
-# In production, replace with a Kafka DLQ topic (e.g. payment_events_dlq).
-_orchestrator_dlq: list = []
 
-
-def get_dlq_snapshot() -> list:
-    """Return a copy of the current DLQ contents (for inspection/testing)."""
-    return list(_orchestrator_dlq)
-
-
-def clear_dlq() -> None:
-    """Clear the DLQ — for testing only."""
-    _orchestrator_dlq.clear()
 
 logger = get_logger("orchestrator")
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
@@ -81,12 +70,11 @@ async def run_orchestrator(db_pool) -> None:
                     event.get("event_type"),
                     event.get("txn_id"),
                 )
-                _orchestrator_dlq.append({
-                    "event": event,
-                    "error": str(last_exc),
-                    "partition": msg.partition,
-                    "offset": msg.offset,
-                })
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO dead_letter_queue (topic, payload, error_reason) VALUES ($1, $2, $3)",
+                        "payment_events", json.dumps({"event": event, "partition": msg.partition, "offset": msg.offset}), str(last_exc)
+                    )
 
             await consumer.commit()
     finally:
@@ -122,7 +110,7 @@ async def _process_event(db_pool, event: dict):
         if event_type == "debit_completed" and current_state == "DEBIT_PENDING":
             # Move to CREDIT_PENDING and emit credit_request
             await _advance_saga(
-                conn, txn_id, "CREDIT_PENDING", None,
+                    conn, txn_id, current_state, "CREDIT_PENDING", None,
                 [
                     {
                         "topic": "payment_commands",
@@ -144,7 +132,7 @@ async def _process_event(db_pool, event: dict):
         elif event_type == "debit_failed" and current_state == "DEBIT_PENDING":
             # Move to FAILED
             await _advance_saga(
-                conn, txn_id, "FAILED", payload.get("reason"),
+                    conn, txn_id, current_state, "FAILED", payload.get("reason"),
                 [
                     {
                         "topic": "payment_events",
@@ -157,7 +145,7 @@ async def _process_event(db_pool, event: dict):
         elif event_type == "credit_completed" and current_state == "CREDIT_PENDING":
             # Move to COMPLETED
             await _advance_saga(
-                conn, txn_id, "COMPLETED", None,
+                    conn, txn_id, current_state, "COMPLETED", None,
                 [
                     {
                         "topic": "payment_events",
@@ -170,7 +158,7 @@ async def _process_event(db_pool, event: dict):
         elif event_type == "credit_failed" and current_state == "CREDIT_PENDING":
             # Receiver bank error or timeout. Must compensate sender.
             await _advance_saga(
-                conn, txn_id, "COMPENSATING", payload.get("reason", "Receiver credit failed"),
+                    conn, txn_id, current_state, "COMPENSATING", payload.get("reason", "Receiver credit failed"),
                 [
                     {
                         "topic": "payment_commands",
@@ -192,7 +180,7 @@ async def _process_event(db_pool, event: dict):
                 # Debit DID happen. Proceed with credit as normal.
                 logger.info("Ambiguous debit resolved: SUCCESS — proceeding with credit", extra={"txn_id": txn_id})
                 await _advance_saga(
-                    conn, txn_id, "CREDIT_PENDING", None,
+                    conn, txn_id, current_state, "CREDIT_PENDING", None,
                     [
                         {
                             "topic": "payment_commands",
@@ -210,7 +198,7 @@ async def _process_event(db_pool, event: dict):
                 # Debit did NOT happen. Safe to fail without compensation.
                 logger.info("Ambiguous debit resolved: NOT_FOUND — marking FAILED", extra={"txn_id": txn_id})
                 await _advance_saga(
-                    conn, txn_id, "FAILED", "Debit not executed (confirmed by bank)",
+                    conn, txn_id, current_state, "FAILED", "Debit not executed (confirmed by bank)",
                     [
                         {
                             "topic": "payment_events",
@@ -223,7 +211,7 @@ async def _process_event(db_pool, event: dict):
                 # Bank is UNAVAILABLE — cannot determine outcome. Move to INDETERMINATE for manual review.
                 logger.warning("Ambiguous debit unresolvable: bank UNAVAILABLE — moving to INDETERMINATE", extra={"txn_id": txn_id})
                 await _advance_saga(
-                    conn, txn_id, "INDETERMINATE", "Debit outcome unknown (bank unreachable after timeout)",
+                    conn, txn_id, current_state, "INDETERMINATE", "Debit outcome unknown (bank unreachable after timeout)",
                     []
                 )
 
@@ -235,7 +223,7 @@ async def _process_event(db_pool, event: dict):
                 # Credit DID happen. Mark COMPLETED. Compensation would be a double-spend.
                 logger.info("Ambiguous credit resolved: SUCCESS — marking COMPLETED", extra={"txn_id": txn_id})
                 await _advance_saga(
-                    conn, txn_id, "COMPLETED", None,
+                    conn, txn_id, current_state, "COMPLETED", None,
                     [
                         {
                             "topic": "payment_events",
@@ -248,7 +236,7 @@ async def _process_event(db_pool, event: dict):
                 # Credit did NOT happen. Safe to compensate the sender.
                 logger.info("Ambiguous credit resolved: NOT_FOUND — compensating sender", extra={"txn_id": txn_id})
                 await _advance_saga(
-                    conn, txn_id, "COMPENSATING", "Credit not executed (confirmed by bank) — compensating sender",
+                    conn, txn_id, current_state, "COMPENSATING", "Credit not executed (confirmed by bank) — compensating sender",
                     [
                         {
                             "topic": "payment_commands",
@@ -261,14 +249,14 @@ async def _process_event(db_pool, event: dict):
                 # Bank is UNAVAILABLE — cannot determine outcome safely. Move to INDETERMINATE.
                 logger.warning("Ambiguous credit unresolvable: bank UNAVAILABLE — moving to INDETERMINATE", extra={"txn_id": txn_id})
                 await _advance_saga(
-                    conn, txn_id, "INDETERMINATE", "Credit outcome unknown (bank unreachable after timeout)",
+                    conn, txn_id, current_state, "INDETERMINATE", "Credit outcome unknown (bank unreachable after timeout)",
                     []
                 )
 
         elif event_type == "compensate_completed" and current_state == "COMPENSATING":
             # Move to COMPENSATED
             await _advance_saga(
-                conn, txn_id, "COMPENSATED", None,
+                    conn, txn_id, current_state, "COMPENSATED", None,
                 [
                     {
                         "topic": "payment_events",
@@ -281,7 +269,7 @@ async def _process_event(db_pool, event: dict):
         elif event_type == "compensate_failed" and current_state == "COMPENSATING":
             # Critical failure
             await _advance_saga(
-                conn, txn_id, "COMPENSATION_FAILED", payload.get("reason", "Both credit and compensation failed"),
+                    conn, txn_id, current_state, "COMPENSATION_FAILED", payload.get("reason", "Both credit and compensation failed"),
                 [
                     {
                         "topic": "payment_events",
@@ -296,7 +284,7 @@ async def _process_event(db_pool, event: dict):
                 ]
             )
 
-async def _advance_saga(conn, txn_id: str, new_state: str, error_reason: str, outbox_events: list):
+async def _advance_saga(conn, txn_id: str, expected_state: str, new_state: str, error_reason: str, outbox_events: list):
     """Update saga state and append to outbox transactionally.
 
     NOTE: txn_id is cast to uuid.UUID() for asyncpg type correctness.
@@ -305,23 +293,26 @@ async def _advance_saga(conn, txn_id: str, new_state: str, error_reason: str, ou
     """
     txn_uuid = uuid.UUID(txn_id)
     async with conn.transaction():
-        await conn.execute(
+        res = await conn.execute(
             """
             UPDATE saga_transactions
             SET state = $1, error_reason = $2, updated_at = NOW()
-            WHERE txn_id = $3
+            WHERE txn_id = $3 AND state = $4
             """,
-            new_state, error_reason, txn_uuid
+            new_state, error_reason, txn_uuid, expected_state
         )
-        if outbox_events:
-            for ev in outbox_events:
-                await conn.execute(
-                    """
-                    INSERT INTO outbox_events (txn_id, topic, event_type, payload)
-                    VALUES ($1, $2, $3, $4)
-                    """,
-                    txn_uuid, ev["topic"], ev["event_type"], json.dumps(ev["payload"])
-                )
+        if res == "UPDATE 1":
+            if outbox_events:
+                for ev in outbox_events:
+                    await conn.execute(
+                        """
+                        INSERT INTO outbox_events (txn_id, topic, event_type, payload)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        txn_uuid, ev["topic"], ev["event_type"], json.dumps(ev["payload"])
+                    )
+        else:
+            logger.info("Saga update preempted (txn_id: %s, expected: %s) - ignoring event.", txn_id, expected_state)
 
 async def _query_bank_for_operation(bank_url: str, txn_id: str, operation: str, timeout: float = 5.0) -> str:
     """
