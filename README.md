@@ -75,6 +75,27 @@ payflow/
 
 ## How to Run Locally
 
+### 1. Run via Docker Compose (Recommended)
+
+The easiest way to run the complete PayFlow system is using Docker Compose. This will spin up the Gateway, Banks (HDFC/SBI), Ledger, Notifications, Postgres, Redis, Kafka, and Monitoring (Prometheus/Grafana) all in one go.
+
+```bash
+# Start all services
+docker compose up --build -d
+
+# Verify services are running
+docker compose ps
+
+# Test a payment
+curl -X POST http://localhost:8000/pay \
+  -H "Content-Type: application/json" \
+  -d '{"sender_vpa": "utkarsh@hdfc", "receiver_vpa": "alice@sbi", "amount": 100.0, "currency": "INR"}'
+
+# Stop the system
+docker compose down
+```
+
+### 2. Run Locally without Docker (Development)
 ### 1. Start the Infrastructure
 
 Spin up PostgreSQL, Redis, Kafka, Zookeeper, Prometheus, and Grafana:
