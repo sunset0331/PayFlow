@@ -8,9 +8,7 @@ from services.bank_hdfc.main import app as hdfc_app
 
 # Prevent duplicate metrics registration when importing multiple apps in the same process
 from prometheus_client import REGISTRY
-collectors = list(REGISTRY._collector_to_names.keys())
-for collector in collectors:
-    REGISTRY.unregister(collector)
+# No longer needed since bank metrics are shared
 
 from services.bank_sbi.main import app as sbi_app
 from shared.redis_client import get_redis
@@ -111,6 +109,12 @@ def mock_asyncpg():
     async def smart_fetchrow(query, *args, **kwargs):
         if "FROM transactions" in query:
             return None # Not processed yet
+        if "FROM vpa_registry" in query:
+            # Provide dummy routing data for tests
+            vpa = args[0] if args else "alice@hdfc"
+            bank_slug = vpa.split("@")[1] if "@" in vpa else "hdfc"
+            url = f"http://127.0.0.1:8001" if bank_slug == "hdfc" else "http://127.0.0.1:8002"
+            return {"bank_service_url": url, "is_active": True}
         return {"balance": Decimal("1000.0")}
     
     mock_conn.fetchrow = AsyncMock(side_effect=smart_fetchrow)

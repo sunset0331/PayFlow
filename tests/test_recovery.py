@@ -140,8 +140,9 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
                 'sender_vpa': 'c@sbi', 'receiver_vpa': 'd@hdfc', 'amount': 50.0
             }
         ]
+        self.mock_conn.fetchrow.return_value = {"bank_service_url": "http://mock-bank"}
         
-        await _recovery_scan(self.db_pool, {'hdfc': 'http://hdfc', 'sbi': 'http://sbi'}, self.kafka_publish_fn)
+        await _recovery_scan(self.db_pool, self.kafka_publish_fn)
         
         # Both handlers should be called exactly once
         self.assertEqual(mock_debit_completed.call_count, 1)
@@ -151,7 +152,7 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
         """Test 7: Same Saga cannot be recovered concurrently."""
         self.mock_conn.fetch.return_value = []
         
-        await _recovery_scan(self.db_pool, {}, self.kafka_publish_fn)
+        await _recovery_scan(self.db_pool, self.kafka_publish_fn)
         
         # Check that the query uses FOR UPDATE SKIP LOCKED
         query_called = self.mock_conn.fetch.call_args[0][0]
