@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import time
+import httpx
 from aiokafka import AIOKafkaConsumer
 from shared.logger import get_logger
 
@@ -135,6 +136,87 @@ async def _process_event(db_pool, event: dict):
                 ]
             )
 
+        elif event_type == "debit_ambiguous" and current_state == "DEBIT_PENDING":
+            # Network timeout during debit — outcome unknown. Query the sender bank to find out.
+            bank_url = payload.get("bank_url") or sender_url
+            bank_status = await _query_bank_for_operation(bank_url, txn_id, "DEBIT")
+            if bank_status == "SUCCESS":
+                # Debit DID happen. Proceed with credit as normal.
+                logger.info("Ambiguous debit resolved: SUCCESS — proceeding with credit", extra={"txn_id": txn_id})
+                await _advance_saga(
+                    conn, txn_id, "CREDIT_PENDING", None,
+                    [
+                        {
+                            "topic": "payment_commands",
+                            "event_type": "credit_request",
+                            "payload": {"vpa": receiver_vpa, "amount": amount, "bank_url": receiver_url}
+                        },
+                        {
+                            "topic": "payment_events",
+                            "event_type": "DEBIT_COMPLETED",
+                            "payload": {}
+                        }
+                    ]
+                )
+            elif bank_status == "NOT_FOUND":
+                # Debit did NOT happen. Safe to fail without compensation.
+                logger.info("Ambiguous debit resolved: NOT_FOUND — marking FAILED", extra={"txn_id": txn_id})
+                await _advance_saga(
+                    conn, txn_id, "FAILED", "Debit not executed (confirmed by bank)",
+                    [
+                        {
+                            "topic": "payment_events",
+                            "event_type": "PAYMENT_FAILED",
+                            "payload": {"reason": "Debit not executed (confirmed by bank)"}
+                        }
+                    ]
+                )
+            else:
+                # Bank is UNAVAILABLE — cannot determine outcome. Move to INDETERMINATE for manual review.
+                logger.warning("Ambiguous debit unresolvable: bank UNAVAILABLE — moving to INDETERMINATE", extra={"txn_id": txn_id})
+                await _advance_saga(
+                    conn, txn_id, "INDETERMINATE", "Debit outcome unknown (bank unreachable after timeout)",
+                    []
+                )
+
+        elif event_type == "credit_ambiguous" and current_state == "CREDIT_PENDING":
+            # Network timeout during credit — outcome unknown. Query the receiver bank.
+            bank_url = payload.get("bank_url") or receiver_url
+            bank_status = await _query_bank_for_operation(bank_url, txn_id, "CREDIT")
+            if bank_status == "SUCCESS":
+                # Credit DID happen. Mark COMPLETED. Compensation would be a double-spend.
+                logger.info("Ambiguous credit resolved: SUCCESS — marking COMPLETED", extra={"txn_id": txn_id})
+                await _advance_saga(
+                    conn, txn_id, "COMPLETED", None,
+                    [
+                        {
+                            "topic": "payment_events",
+                            "event_type": "PAYMENT_SUCCESS",
+                            "payload": {"status": "completed", "resolved": "ambiguous_credit"}
+                        }
+                    ]
+                )
+            elif bank_status == "NOT_FOUND":
+                # Credit did NOT happen. Safe to compensate the sender.
+                logger.info("Ambiguous credit resolved: NOT_FOUND — compensating sender", extra={"txn_id": txn_id})
+                await _advance_saga(
+                    conn, txn_id, "COMPENSATING", "Credit not executed (confirmed by bank) — compensating sender",
+                    [
+                        {
+                            "topic": "payment_commands",
+                            "event_type": "compensate_request",
+                            "payload": {"vpa": sender_vpa, "amount": amount, "bank_url": sender_url}
+                        }
+                    ]
+                )
+            else:
+                # Bank is UNAVAILABLE — cannot determine outcome safely. Move to INDETERMINATE.
+                logger.warning("Ambiguous credit unresolvable: bank UNAVAILABLE — moving to INDETERMINATE", extra={"txn_id": txn_id})
+                await _advance_saga(
+                    conn, txn_id, "INDETERMINATE", "Credit outcome unknown (bank unreachable after timeout)",
+                    []
+                )
+
         elif event_type == "compensate_completed" and current_state == "COMPENSATING":
             # Move to COMPENSATED
             await _advance_saga(
@@ -186,6 +268,35 @@ async def _advance_saga(conn, txn_id: str, new_state: str, error_reason: str, ou
                     """,
                     txn_id, ev["topic"], ev["event_type"], json.dumps(ev["payload"])
                 )
+
+async def _query_bank_for_operation(bank_url: str, txn_id: str, operation: str, timeout: float = 5.0) -> str:
+    """
+    Query a bank service to determine whether a specific operation was executed.
+
+    Returns:
+        'SUCCESS'   — the operation was executed at the bank
+        'NOT_FOUND' — the operation was NOT executed (safe to retry or compensate)
+        'UNAVAILABLE' — the bank is unreachable (requires manual review)
+    """
+    if not bank_url:
+        logger.error("Cannot query bank: no URL available", extra={"txn_id": txn_id, "operation": operation})
+        return "UNAVAILABLE"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{bank_url}/transaction/{txn_id}?operation={operation}")
+        if resp.status_code == 200:
+            return resp.json().get("status", "SUCCESS")
+        elif resp.status_code == 404:
+            return "NOT_FOUND"
+        else:
+            logger.warning("Bank returned unexpected status during ambiguity check",
+                           extra={"txn_id": txn_id, "operation": operation, "status_code": resp.status_code})
+            return "UNAVAILABLE"
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        logger.warning("Bank unreachable during ambiguity check",
+                       extra={"txn_id": txn_id, "operation": operation, "error": str(e)})
+        return "UNAVAILABLE"
+
 
 async def _get_routing_url(conn, vpa: str) -> str:
     """Retrieve the routing URL for a VPA."""
