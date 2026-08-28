@@ -164,8 +164,10 @@ async def main():
                 await consumer.commit()
             except Exception as e:
                 logger.error("Failed to process command %s: %s", event, e, exc_info=True)
-                # In a real system we would implement retry/DLQ here, but for now we skip to avoid blocking.
-                await consumer.commit()
+                # DO NOT commit offset on failure. This ensures the message is redelivered
+                # if the worker restarts. We pause briefly and raise to allow crash-loop backoff.
+                await asyncio.sleep(5)
+                raise
                 
     finally:
         await consumer.stop()

@@ -5,10 +5,10 @@ import uuid
 
 # Set environment before importing
 import os
-os.environ["ADMIN_TOKEN"] = "supersecretadmin"
+os.environ["ADMIN_TOKEN"] = "test_admin_token"
 
 from services.gateway import main
-main.ADMIN_TOKEN = "supersecretadmin"
+main.ADMIN_TOKEN = "test_admin_token"
 from services.gateway.main import app
 
 client = TestClient(app)
@@ -38,7 +38,7 @@ def mock_db_pool():
 
 @pytest.fixture
 def auth_headers():
-    return {"X-Admin-Token": "supersecretadmin"}
+    return {"X-Admin-Token": "test_admin_token"}
 
 def test_unauthorized_rejects_missing_token():
     response = client.get("/admin/sagas/indeterminate")

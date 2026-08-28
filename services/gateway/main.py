@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, Request, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import hashlib
 from datetime import datetime
+from decimal import Decimal
 import httpx
 import uuid
 import asyncpg
@@ -70,7 +71,7 @@ app = FastAPI(title="PayFlow UPI Gateway", lifespan=lifespan)
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_gateway")
+GATEWAY_DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:dummy_pass@postgres:5432/db_gateway")
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
@@ -125,7 +126,8 @@ gateway_saga_states_total = Counter(
 class PaymentRequest(BaseModel):
     sender_vpa: str
     receiver_vpa: str
-    amount: float
+    amount: Decimal = Field(..., gt=0)
+    currency: Optional[str] = "INR"
 
 class VpaPayload(BaseModel):
     vpa: str
@@ -409,7 +411,7 @@ async def initiate_payment(
                     "topic": "payment_events",
                     "event_type": "PAYMENT_INITIATED",
                     "payload": {
-                        "amount": payload.amount,
+                        "amount": float(payload.amount),
                         "sender": payload.sender_vpa,
                         "receiver": payload.receiver_vpa
                     }
@@ -426,7 +428,7 @@ async def initiate_payment(
                     "event_type": "debit_request",
                     "payload": {
                         "vpa": payload.sender_vpa,
-                        "amount": payload.amount,
+                        "amount": float(payload.amount),
                         "bank_url": sender_url
                     }
                 }

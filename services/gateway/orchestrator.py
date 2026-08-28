@@ -19,8 +19,6 @@ from shared.logger import get_logger
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1  # sleep(attempt * RETRY_BACKOFF_SECONDS) between retries
 
-# In-memory Dead Letter Queue: events that exhausted all retries.
-# Each entry: {"event": ..., "error": ..., "partition": ..., "offset": ...}
 
 
 logger = get_logger("orchestrator")
