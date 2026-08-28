@@ -137,6 +137,23 @@ services:
     networks:
       - payflow_net
 
+  reconciliation-worker:
+    build: .
+    command: python -m services.reconciliation_worker.main
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://payflow_admin:secretpassword@postgres:5432/db_gateway
+      LEDGER_URL: http://ledger:8003
+      BATCH_SIZE: 50
+      LOOKBACK_MINUTES: 120
+      RECONCILIATION_INTERVAL_SECONDS: 10
+    ports:
+      - "8006:8006"
+    networks:
+      - payflow_net
+
   # Monitoring Infrastructure
   nginx:
     image: nginx:alpine

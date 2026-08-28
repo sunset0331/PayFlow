@@ -17,3 +17,6 @@ scrape_configs:
   - job_name: 'notifications'
     static_configs:
       - targets: ['notifications:8004']
+  - job_name: 'reconciliation'
+    static_configs:
+      - targets: ['reconciliation-worker:8006']
