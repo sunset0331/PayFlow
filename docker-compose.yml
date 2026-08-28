@@ -134,6 +134,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      bank-hdfc:
+        condition: service_started
+      bank-sbi:
+        condition: service_started
+    environment:
+      KAFKA_BROKER_URL: kafka:9092
+      HDFC_BANK_URL: http://bank-hdfc:8001
+      SBI_BANK_URL: http://bank-sbi:8002
     networks:
       - payflow_net
 

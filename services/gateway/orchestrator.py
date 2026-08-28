@@ -10,9 +10,29 @@ import asyncio
 import json
 import os
 import time
+import uuid
 import httpx
 from aiokafka import AIOKafkaConsumer
 from shared.logger import get_logger
+
+# Retry configuration for the consumer loop
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 1  # sleep(attempt * RETRY_BACKOFF_SECONDS) between retries
+
+# In-memory Dead Letter Queue: events that exhausted all retries.
+# Each entry: {"event": ..., "error": ..., "partition": ..., "offset": ...}
+# In production, replace with a Kafka DLQ topic (e.g. payment_events_dlq).
+_orchestrator_dlq: list = []
+
+
+def get_dlq_snapshot() -> list:
+    """Return a copy of the current DLQ contents (for inspection/testing)."""
+    return list(_orchestrator_dlq)
+
+
+def clear_dlq() -> None:
+    """Clear the DLQ — for testing only."""
+    _orchestrator_dlq.clear()
 
 logger = get_logger("orchestrator")
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
@@ -34,13 +54,41 @@ async def run_orchestrator(db_pool) -> None:
     try:
         async for msg in consumer:
             event = msg.value
-            try:
-                await _process_event(db_pool, event)
-                await consumer.commit()
-            except Exception as e:
-                logger.error("Failed to process event %s: %s", event, e, exc_info=True)
-                # Retry logic/DLQ would be here. Committing to avoid blocking for this implementation.
-                await consumer.commit()
+            last_exc = None
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    await _process_event(db_pool, event)
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    logger.warning(
+                        "Orchestrator processing attempt %d/%d failed for event_type=%s txn=%s: %s",
+                        attempt, MAX_RETRIES,
+                        event.get("event_type"), event.get("txn_id"), e,
+                        exc_info=(attempt == MAX_RETRIES),
+                    )
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(attempt * RETRY_BACKOFF_SECONDS)
+
+            if last_exc is not None:
+                # All retries exhausted — route to DLQ and commit offset so we
+                # do not block the consumer partition indefinitely.
+                logger.error(
+                    "Orchestrator exhausted %d retries for event_type=%s txn=%s — routing to DLQ",
+                    MAX_RETRIES,
+                    event.get("event_type"),
+                    event.get("txn_id"),
+                )
+                _orchestrator_dlq.append({
+                    "event": event,
+                    "error": str(last_exc),
+                    "partition": msg.partition,
+                    "offset": msg.offset,
+                })
+
+            await consumer.commit()
     finally:
         await consumer.stop()
 
@@ -52,10 +100,10 @@ async def _process_event(db_pool, event: dict):
     logger.info("Orchestrator received event %s for txn %s", event_type, txn_id)
 
     async with db_pool.acquire() as conn:
-        # Fetch current saga state
+        # Fetch current saga state — cast to uuid.UUID for asyncpg type correctness
         saga = await conn.fetchrow(
             "SELECT sender_vpa, receiver_vpa, amount, state FROM saga_transactions WHERE txn_id = $1",
-            txn_id
+            uuid.UUID(txn_id)
         )
         if not saga:
             logger.warning("Saga not found for txn %s", txn_id)
@@ -249,7 +297,13 @@ async def _process_event(db_pool, event: dict):
             )
 
 async def _advance_saga(conn, txn_id: str, new_state: str, error_reason: str, outbox_events: list):
-    """Update saga state and append to outbox transactionally."""
+    """Update saga state and append to outbox transactionally.
+
+    NOTE: txn_id is cast to uuid.UUID() for asyncpg type correctness.
+    asyncpg does NOT auto-coerce str→UUID; passing a plain string to a UUID
+    column raises asyncpg.exceptions.DataError in production.
+    """
+    txn_uuid = uuid.UUID(txn_id)
     async with conn.transaction():
         await conn.execute(
             """
@@ -257,7 +311,7 @@ async def _advance_saga(conn, txn_id: str, new_state: str, error_reason: str, ou
             SET state = $1, error_reason = $2, updated_at = NOW()
             WHERE txn_id = $3
             """,
-            new_state, error_reason, txn_id
+            new_state, error_reason, txn_uuid
         )
         if outbox_events:
             for ev in outbox_events:
@@ -266,7 +320,7 @@ async def _advance_saga(conn, txn_id: str, new_state: str, error_reason: str, ou
                     INSERT INTO outbox_events (txn_id, topic, event_type, payload)
                     VALUES ($1, $2, $3, $4)
                     """,
-                    txn_id, ev["topic"], ev["event_type"], json.dumps(ev["payload"])
+                    txn_uuid, ev["topic"], ev["event_type"], json.dumps(ev["payload"])
                 )
 
 async def _query_bank_for_operation(bank_url: str, txn_id: str, operation: str, timeout: float = 5.0) -> str:

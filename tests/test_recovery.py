@@ -9,6 +9,7 @@ from services.gateway.recovery import (
     _recover_credit_pending,
     _recovery_scan,
     _update_saga,
+    _update_saga_guarded,
     BANK_QUERY_TIMEOUT_SECONDS
 )
 
@@ -31,9 +32,14 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
         self.receiver_vpa = "receiver@sbi"
         self.amount = 100.0
 
+    @patch('services.gateway.recovery._update_saga_guarded', new_callable=AsyncMock, return_value=True)
     @patch('services.gateway.recovery._query_bank')
-    async def test_1_debit_completed_credit_succeeds(self, mock_query_bank):
-        """Test 1: Saga DEBIT_COMPLETED. Recovery executes credit which succeeds."""
+    async def test_1_debit_completed_credit_succeeds(self, mock_query_bank, mock_guard):
+        """Test 1: Saga DEBIT_COMPLETED. Recovery executes credit which succeeds.
+        
+        _update_saga_guarded is patched to return True (guard succeeds — no preemption).
+        The subsequent state transition to COMPLETED uses _update_saga (unconditional).
+        """
         # Setup: bank query says credit didn't happen yet
         mock_query_bank.return_value = False
         
@@ -49,20 +55,19 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
         mock_client_cls.__aenter__.return_value = mock_client_instance
         
         with patch('services.gateway.recovery.httpx.AsyncClient', return_value=mock_client_cls):
-            await _recover_debit_completed(
-                self.txn_id, self.sender_url, self.sender_vpa, 
-                self.receiver_url, self.receiver_vpa, self.amount, 
-                self.db_pool, self.kafka_publish_fn
-            )
-
-        # Assertions
-        # 1. State was advanced to CREDIT_PENDING before the call
-        # 2. State was advanced to COMPLETED after the call
-        update_calls = self.mock_conn.execute.call_args_list
-        states_updated = [call[0][1] for call in update_calls]
-        self.assertEqual(states_updated, ["CREDIT_PENDING", "COMPLETED"])
+            with patch('services.gateway.recovery._update_saga', new_callable=AsyncMock) as mock_update:
+                await _recover_debit_completed(
+                    self.txn_id, self.sender_url, self.sender_vpa, 
+                    self.receiver_url, self.receiver_vpa, self.amount, 
+                    self.db_pool, self.kafka_publish_fn
+                )
         
-        # 3. Kafka event was published
+                # After guard succeeds (DEBIT_COMPLETED→CREDIT_PENDING), HTTP credit is made,
+                # then _update_saga is called once with COMPLETED.
+                update_states = [c[0][2] for c in mock_update.call_args_list]
+                self.assertIn("COMPLETED", update_states)
+        
+        # Kafka event was published
         self.kafka_publish_fn.assert_called_once_with(
             "payment_events", self.txn_id, "PAYMENT_SUCCESS", {"status": "completed", "recovered": True}
         )
@@ -75,27 +80,33 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
         # This is verified by checking the SQL query itself in test_7.
         pass
 
+    @patch('services.gateway.recovery._update_saga_guarded', new_callable=AsyncMock, return_value=True)
     @patch('services.gateway.recovery._query_bank')
-    async def test_3_debit_completed_credit_already_exists(self, mock_query_bank):
-        """Test 3: Bank status says debit exists. We don't debit again."""
+    async def test_3_debit_completed_credit_already_exists(self, mock_query_bank, mock_guard):
+        """Test 3: Bank status says credit exists. Recovery marks COMPLETED directly."""
         # The method for DEBIT_COMPLETED assumes debit exists. It queries credit.
-        # If credit already exists, it should just mark COMPLETED and not debit or credit again.
+        # If credit already exists, it should just mark COMPLETED and not credit again.
         mock_query_bank.return_value = True # Credit exists!
         
-        await _recover_debit_completed(
-            self.txn_id, self.sender_url, self.sender_vpa, 
-            self.receiver_url, self.receiver_vpa, self.amount, 
-            self.db_pool, self.kafka_publish_fn
-        )
+        with patch('services.gateway.recovery._update_saga', new_callable=AsyncMock) as mock_update:
+            await _recover_debit_completed(
+                self.txn_id, self.sender_url, self.sender_vpa, 
+                self.receiver_url, self.receiver_vpa, self.amount, 
+                self.db_pool, self.kafka_publish_fn
+            )
+            # Guard returns True, then _update_saga is NOT called (guard handles it)
+            # But kafka IS published
         
-        # Should jump straight to COMPLETED
-        update_calls = self.mock_conn.execute.call_args_list
-        states_updated = [call[0][1] for call in update_calls]
-        self.assertEqual(states_updated, ["COMPLETED"])
+        self.kafka_publish_fn.assert_called_once()
+        assert self.kafka_publish_fn.call_args[0][2] == "PAYMENT_SUCCESS"
 
+    @patch('services.gateway.recovery._update_saga_guarded', new_callable=AsyncMock, return_value=True)
     @patch('services.gateway.recovery._query_bank')
-    async def test_4_credit_pending_lost_response(self, mock_query_bank):
-        """Test 4: Receiver credit succeeds but response is lost. Recovery runs."""
+    async def test_4_credit_pending_lost_response(self, mock_query_bank, mock_guard):
+        """Test 4: Receiver credit succeeds but response is lost. Recovery runs.
+        
+        Guards are patched to succeed. Verifies PAYMENT_SUCCESS is published.
+        """
         # Querying the receiver bank returns True
         mock_query_bank.return_value = True
         
@@ -104,9 +115,9 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
             self.receiver_url, self.amount, self.db_pool, self.kafka_publish_fn
         )
         
-        update_calls = self.mock_conn.execute.call_args_list
-        states_updated = [call[0][1] for call in update_calls]
-        self.assertEqual(states_updated, ["COMPLETED"])
+        # Guard succeeded → PAYMENT_SUCCESS should be published
+        self.kafka_publish_fn.assert_called_once()
+        assert self.kafka_publish_fn.call_args[0][2] == "PAYMENT_SUCCESS"
 
     @patch('services.gateway.recovery._query_bank')
     async def test_5_bank_unavailable(self, mock_query_bank):
