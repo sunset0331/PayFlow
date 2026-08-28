@@ -7,10 +7,26 @@ import uuid
 import hashlib
 import os
 from shared.logger import get_logger
+from contextlib import asynccontextmanager
 
 logger = get_logger("ledger")
 
-app = FastAPI(title="Ledger Service")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+    app.state.consumer_task = asyncio.create_task(_supervised_consumer())
+    yield
+    if hasattr(app.state, 'consumer_task') and app.state.consumer_task:
+        app.state.consumer_task.cancel()
+        try:
+            await app.state.consumer_task
+        except asyncio.CancelledError:
+            pass
+    if hasattr(app.state, 'pool') and app.state.pool:
+        await app.state.pool.close()
+
+
+app = FastAPI(title="Ledger Service", lifespan=lifespan)
 DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_ledger")
 
 import time
@@ -144,23 +160,6 @@ async def _supervised_consumer() -> None:
             logger.error("Ledger consumer crashed, restarting in 5s: %s", e, exc_info=True)
             await asyncio.sleep(5)
 
-
-@app.on_event("startup")
-async def startup():
-    app.state.pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
-    # Start supervised consumer — if it crashes, it restarts automatically
-    app.state.consumer_task = asyncio.create_task(_supervised_consumer())
-
-@app.on_event("shutdown")
-async def shutdown():
-    if hasattr(app.state, 'consumer_task') and app.state.consumer_task:
-        app.state.consumer_task.cancel()
-        try:
-            await app.state.consumer_task
-        except asyncio.CancelledError:
-            pass
-    if app.state.pool:
-        await app.state.pool.close()
 
 @app.get("/ledger/{txn_id}")
 async def get_transaction_history(txn_id: str):

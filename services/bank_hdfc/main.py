@@ -7,9 +7,18 @@ import uuid
 from decimal import Decimal
 from typing import Optional
 from shared.logger import get_logger
+from contextlib import asynccontextmanager
 
 logger = get_logger("bank_hdfc")
-app = FastAPI(title="HDFC Bank Service")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await asyncpg.create_pool(DB_URL, min_size=5, max_size=20)
+    yield
+    if hasattr(app.state, 'pool') and app.state.pool:
+        await app.state.pool.close()
+
+app = FastAPI(title="HDFC Bank Service", lifespan=lifespan)
 DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_bank_hdfc")
 
 import time
@@ -58,10 +67,7 @@ class AccountPayload(BaseModel):
     user_name: str
     initial_balance: Decimal = Decimal("0.00")
 
-@app.on_event("startup")
-async def startup():
-    # Connection pooling prevents opening a new TCP connection to Postgres per request
-    app.state.pool = await asyncpg.create_pool(DB_URL, min_size=5, max_size=20)
+
 
 # ---------------------------------------------------------------------------
 # Account Management Endpoints
