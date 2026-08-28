@@ -1,3 +1,17 @@
+def _make_dummy_db_pool():
+    from unittest.mock import MagicMock, AsyncMock
+    mock_pool = MagicMock()
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+    acquire_ctx = AsyncMock()
+    acquire_ctx.__aenter__.return_value = mock_conn
+    mock_pool.acquire.return_value = acquire_ctx
+    txn_ctx = MagicMock()
+    txn_ctx.__aenter__ = AsyncMock(return_value=None)
+    txn_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.transaction = MagicMock(return_value=txn_ctx)
+    return mock_pool
+
 """
 Reliability Hardening Tests — PayFlow Gateway
 
@@ -36,7 +50,8 @@ def _make_db_pool_for_orchestrator(state="DEBIT_PENDING",
                                    receiver_vpa="bob@sbi",
                                    amount=100.0):
     mock_pool = MagicMock()
-    mock_conn = MagicMock()
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock(return_value='UPDATE 1')
 
     acquire_ctx = AsyncMock()
     acquire_ctx.__aenter__.return_value = mock_conn
@@ -45,7 +60,7 @@ def _make_db_pool_for_orchestrator(state="DEBIT_PENDING",
     txn_ctx = MagicMock()
     txn_ctx.__aenter__ = AsyncMock(return_value=None)
     txn_ctx.__aexit__ = AsyncMock(return_value=False)
-    mock_conn.transaction.return_value = txn_ctx
+    mock_conn.transaction = MagicMock(return_value=txn_ctx)
     mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
     async def smart_fetchrow(query, *args, **kwargs):
@@ -71,12 +86,10 @@ class TestOrchestratorRetryAndDLQ:
 
     def setup_method(self):
         from services.gateway import orchestrator as m
-        m.clear_dlq()
 
     @pytest.mark.asyncio
     async def test_success_on_first_attempt_no_dlq(self):
         from services.gateway import orchestrator as m
-        m.clear_dlq()
         mock_pool, _ = _make_db_pool_for_orchestrator()
         msg = _make_msg("debit_completed", str(uuid.uuid4()))
         mock_consumer = AsyncMock()
@@ -87,13 +100,14 @@ class TestOrchestratorRetryAndDLQ:
         with patch("services.gateway.orchestrator.AIOKafkaConsumer", return_value=mock_consumer):
             with patch("services.gateway.orchestrator._process_event", new_callable=AsyncMock):
                 await m.run_orchestrator(mock_pool)
-        assert m.get_dlq_snapshot() == []
+        mock_conn = mock_pool.acquire.return_value.__aenter__.return_value
+        insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO dead_letter_queue" in c.args[0]]
+        assert len(insert_calls) == 0
         mock_consumer.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_transient_failure_retries_then_succeeds(self):
         from services.gateway import orchestrator as m
-        m.clear_dlq()
         mock_pool, _ = _make_db_pool_for_orchestrator()
         msg = _make_msg("debit_completed", str(uuid.uuid4()))
         mock_consumer = AsyncMock()
@@ -115,13 +129,14 @@ class TestOrchestratorRetryAndDLQ:
                     await m.run_orchestrator(mock_pool)
 
         assert call_count == 3
-        assert m.get_dlq_snapshot() == []
+        mock_conn = mock_pool.acquire.return_value.__aenter__.return_value
+        insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO dead_letter_queue" in c.args[0]]
+        assert len(insert_calls) == 0
         mock_consumer.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_exhausted_retries_route_to_dlq_and_commit_offset(self):
         from services.gateway import orchestrator as m
-        m.clear_dlq()
         mock_pool, _ = _make_db_pool_for_orchestrator()
         txn_id = str(uuid.uuid4())
         msg = _make_msg("debit_completed", txn_id, partition=2, offset=99)
@@ -143,19 +158,22 @@ class TestOrchestratorRetryAndDLQ:
                     await m.run_orchestrator(mock_pool)
 
         assert call_count == m.MAX_RETRIES
-        dlq = m.get_dlq_snapshot()
-        assert len(dlq) == 1
-        assert dlq[0]["event"]["txn_id"] == txn_id
-        assert dlq[0]["partition"] == 2
-        assert dlq[0]["offset"] == 99
-        assert "Permanent failure" in dlq[0]["error"]
+        mock_conn = mock_pool.acquire.return_value.__aenter__.return_value
+        insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO dead_letter_queue" in c.args[0]]
+        assert len(insert_calls) == 1
+        query, topic, payload, error = insert_calls[0].args
+        import json
+        payload_dict = json.loads(payload)
+        assert payload_dict["event"]["txn_id"] == txn_id
+        assert payload_dict["partition"] == 2
+        assert payload_dict["offset"] == 99
+        assert "Permanent failure" in error
         # Offset must be committed even after DLQ — no consumer block
         mock_consumer.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_multiple_events_selective_dlq(self):
         from services.gateway import orchestrator as m
-        m.clear_dlq()
         mock_pool, _ = _make_db_pool_for_orchestrator()
         txn1 = str(uuid.uuid4())
         txn2 = str(uuid.uuid4())
@@ -175,10 +193,10 @@ class TestOrchestratorRetryAndDLQ:
             with patch("services.gateway.orchestrator._process_event", side_effect=selective_fail):
                 with patch("asyncio.sleep", new_callable=AsyncMock):
                     await m.run_orchestrator(mock_pool)
-
-        dlq = m.get_dlq_snapshot()
-        assert len(dlq) == 1
-        assert dlq[0]["event"]["txn_id"] == txn1
+        mock_conn = mock_pool.acquire.return_value.__aenter__.return_value
+        insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO dead_letter_queue" in c.args[0]]
+        assert len(insert_calls) == 1
+        import json; assert json.loads(insert_calls[0].args[2])["event"]["txn_id"] == txn1
         assert mock_consumer.commit.call_count == 2
 
 
@@ -191,14 +209,15 @@ class TestUUIDCasting:
     @pytest.mark.asyncio
     async def test_advance_saga_update_uses_uuid(self):
         from services.gateway.orchestrator import _advance_saga
-        mock_conn = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value='UPDATE 1')
         txn_ctx = MagicMock()
         txn_ctx.__aenter__ = AsyncMock(return_value=None)
         txn_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_conn.transaction.return_value = txn_ctx
+        mock_conn.transaction = MagicMock(return_value=txn_ctx)
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
         txn_id_str = str(uuid.uuid4())
-        await _advance_saga(mock_conn, txn_id_str, "COMPLETED", None, [])
+        await _advance_saga(mock_conn, txn_id_str, "DEBIT_PENDING", "COMPLETED", None, [])
         update_call = mock_conn.execute.call_args_list[0]
         txn_arg = update_call[0][3]
         assert isinstance(txn_arg, uuid.UUID), (
@@ -208,15 +227,16 @@ class TestUUIDCasting:
     @pytest.mark.asyncio
     async def test_advance_saga_outbox_insert_uses_uuid(self):
         from services.gateway.orchestrator import _advance_saga
-        mock_conn = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value='UPDATE 1')
         txn_ctx = MagicMock()
         txn_ctx.__aenter__ = AsyncMock(return_value=None)
         txn_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_conn.transaction.return_value = txn_ctx
+        mock_conn.transaction = MagicMock(return_value=txn_ctx)
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
         txn_id_str = str(uuid.uuid4())
         outbox = [{"topic": "payment_events", "event_type": "PAYMENT_SUCCESS", "payload": {}}]
-        await _advance_saga(mock_conn, txn_id_str, "COMPLETED", None, outbox)
+        await _advance_saga(mock_conn, txn_id_str, "DEBIT_PENDING", "COMPLETED", None, outbox)
         insert_call = mock_conn.execute.call_args_list[1]
         txn_arg = insert_call[0][1]
         assert isinstance(txn_arg, uuid.UUID), (
@@ -251,7 +271,8 @@ class TestRecoveryGuardedUpdate:
 
     def _pool(self, result_str):
         mock_pool = MagicMock()
-        mock_conn = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value='UPDATE 1')
         acquire_ctx = AsyncMock()
         acquire_ctx.__aenter__.return_value = mock_conn
         mock_pool.acquire.return_value = acquire_ctx
@@ -308,7 +329,7 @@ class TestRecoveryRacePrevention:
                         str(uuid.uuid4()),
                         "http://bank-hdfc:8001", "alice@hdfc",
                         "http://bank-sbi:8002", 100.0,
-                        MagicMock(), mock_kafka
+                        _make_dummy_db_pool(), mock_kafka
                     )
                     mock_credit.assert_not_called()
         mock_kafka.assert_not_called()
@@ -328,10 +349,9 @@ class TestRecoveryRacePrevention:
                             str(uuid.uuid4()),
                             "http://bank-hdfc:8001", "alice@hdfc",
                             "http://bank-sbi:8002", 100.0,
-                            MagicMock(), mock_kafka
+                            _make_dummy_db_pool(), mock_kafka
                         )
-        mock_kafka.assert_called_once()
-        assert mock_kafka.call_args[0][2] == "PAYMENT_COMPENSATED"
+        mock_kafka.assert_not_called()  # Now handled by Outbox
 
     @pytest.mark.asyncio
     async def test_credit_pending_completed_preempted_no_action(self):
@@ -345,7 +365,7 @@ class TestRecoveryRacePrevention:
                     str(uuid.uuid4()),
                     "http://bank-hdfc:8001", "alice@hdfc",
                     "http://bank-sbi:8002", 100.0,
-                    MagicMock(), mock_kafka
+                    _make_dummy_db_pool(), mock_kafka
                 )
         mock_kafka.assert_not_called()
 
@@ -360,7 +380,7 @@ class TestRecoveryRacePrevention:
                 await _recover_debit_pending(
                     str(uuid.uuid4()),
                     "http://bank-hdfc:8001", "alice@hdfc", 100.0,
-                    MagicMock(), mock_kafka
+                    _make_dummy_db_pool(), mock_kafka
                 )
         mock_kafka.assert_not_called()
 
@@ -375,7 +395,7 @@ class TestRecoveryRacePrevention:
                 await _recover_compensating(
                     str(uuid.uuid4()),
                     "http://bank-hdfc:8001", "alice@hdfc", 100.0,
-                    MagicMock(), mock_kafka
+                    _make_dummy_db_pool(), mock_kafka
                 )
         mock_kafka.assert_not_called()
 
@@ -390,7 +410,6 @@ class TestRecoveryRacePrevention:
                 await _recover_compensating(
                     str(uuid.uuid4()),
                     "http://bank-hdfc:8001", "alice@hdfc", 100.0,
-                    MagicMock(), mock_kafka
+                    _make_dummy_db_pool(), mock_kafka
                 )
-        mock_kafka.assert_called_once()
-        assert mock_kafka.call_args[0][2] == "PAYMENT_COMPENSATED"
+        mock_kafka.assert_not_called()  # Now handled by Outbox

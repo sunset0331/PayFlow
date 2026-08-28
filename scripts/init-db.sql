@@ -137,6 +137,22 @@ CREATE TABLE reconciliation_results (
     resolved_at TIMESTAMP
 );
 
+CREATE TABLE admin_audit_log (
+    id SERIAL PRIMARY KEY,
+    txn_id UUID NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    result VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE dead_letter_queue (
+    id SERIAL PRIMARY KEY,
+    topic VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    error_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 \c db_ledger;
 CREATE TABLE events (
     event_id UUID PRIMARY KEY,
@@ -147,3 +163,11 @@ CREATE TABLE events (
 );
 -- Index for fast lookup by transaction ID
 CREATE INDEX idx_txn_id ON events(txn_id);
+
+CREATE TABLE dead_letter_queue (
+    id SERIAL PRIMARY KEY,
+    topic VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    error_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

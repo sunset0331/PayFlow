@@ -95,15 +95,18 @@ def mock_kafka():
 def mock_asyncpg():
     """Mock PostgreSQL globally."""
     mock_pool = MagicMock()
-    mock_conn = MagicMock()
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock(return_value='UPDATE 1')
     
     # Setup for transaction and context manager
     acquire_ctx = AsyncMock()
     acquire_ctx.__aenter__.return_value = mock_conn
     mock_pool.acquire.return_value = acquire_ctx
     
-    txn_ctx = AsyncMock()
-    mock_conn.transaction.return_value = txn_ctx
+    txn_ctx = MagicMock()
+    txn_ctx.__aenter__ = AsyncMock(return_value=None)
+    txn_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.transaction = MagicMock(return_value=txn_ctx)
     
     from decimal import Decimal
     async def smart_fetchrow(query, *args, **kwargs):
