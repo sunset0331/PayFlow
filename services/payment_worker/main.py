@@ -73,8 +73,10 @@ async def process_command(event: dict, producer: AIOKafkaProducer):
                     await _publish_event(producer, txn_id, "debit_failed", {"reason": "Bank error"})
                     
             except httpx.RequestError as e:
-                logger.error("Bank unreachable during debit", extra={"txn_id": txn_id, "error": str(e)})
-                await _publish_event(producer, txn_id, "debit_failed", {"reason": "Sender bank unreachable"})
+                # Network-level failure: we do NOT know whether the bank executed the debit.
+                # Emit debit_ambiguous so the Orchestrator can query the bank before deciding.
+                logger.warning("Debit request timed out or network error — outcome unknown", extra={"txn_id": txn_id, "error": str(e)})
+                await _publish_event(producer, txn_id, "debit_ambiguous", {"bank_url": bank_url, "reason": str(e)})
                 
         elif event_type == "credit_request":
             try:
@@ -91,12 +93,15 @@ async def process_command(event: dict, producer: AIOKafkaProducer):
                 await _publish_event(producer, txn_id, "credit_completed", {"vpa": vpa, "amount": amount})
                 logger.info("Credit completed successfully", extra={"txn_id": txn_id})
                 
-            except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                # If credit times out or fails (e.g. 500), we don't know the state for sure.
-                # In this worker, we simply report credit_failed. 
-                # The Gateway Orchestrator will query the bank before compensating.
-                logger.warning("Credit failed or timed out", extra={"txn_id": txn_id, "error": str(e)})
-                await _publish_event(producer, txn_id, "credit_failed", {"reason": "Receiver bank error or timeout"})
+            except httpx.HTTPStatusError as e:
+                # The bank responded with a clear error (4xx/5xx). The outcome is known: credit did NOT happen.
+                logger.warning("Credit returned HTTP error", extra={"txn_id": txn_id, "status_code": e.response.status_code, "error": str(e)})
+                await _publish_event(producer, txn_id, "credit_failed", {"reason": f"Receiver bank HTTP {e.response.status_code}"})
+            except httpx.RequestError as e:
+                # Network-level failure: we do NOT know whether the bank executed the credit.
+                # Emit credit_ambiguous so the Orchestrator can query the bank before compensating.
+                logger.warning("Credit request timed out or network error — outcome unknown", extra={"txn_id": txn_id, "error": str(e)})
+                await _publish_event(producer, txn_id, "credit_ambiguous", {"bank_url": bank_url, "reason": str(e)})
                 
         elif event_type == "compensate_request":
             try:
