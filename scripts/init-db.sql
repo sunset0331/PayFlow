@@ -116,6 +116,27 @@ CREATE INDEX idx_saga_state_updated
     ON saga_transactions (state, updated_at)
     WHERE state NOT IN ('COMPLETED', 'FAILED', 'INDETERMINATE', 'COMPENSATION_FAILED', 'COMPENSATED');
 
+-- Index for the reconciliation worker: find terminal sagas efficiently
+CREATE INDEX idx_saga_state_terminal
+    ON saga_transactions (state, created_at)
+    WHERE state IN ('COMPLETED', 'FAILED', 'INDETERMINATE', 'COMPENSATION_FAILED', 'COMPENSATED');
+
+-- Reconciliation Results Table
+CREATE TABLE reconciliation_results (
+    id SERIAL PRIMARY KEY,
+    txn_id UUID UNIQUE NOT NULL REFERENCES saga_transactions(txn_id) ON DELETE CASCADE,
+    reconciliation_status VARCHAR(50) NOT NULL,
+    saga_state VARCHAR(50),
+    sender_bank_status VARCHAR(50),
+    receiver_bank_status VARCHAR(50),
+    ledger_status VARCHAR(50),
+    discrepancy_type VARCHAR(100),
+    details JSONB,
+    first_detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP
+);
+
 \c db_ledger;
 CREATE TABLE events (
     event_id UUID PRIMARY KEY,
