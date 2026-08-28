@@ -17,6 +17,10 @@ CREATE TABLE accounts (
     status VARCHAR(50) DEFAULT 'ACTIVE'
 );
 
+INSERT INTO accounts (account_id, vpa, balance, user_name) VALUES 
+('11111111-1111-1111-1111-111111111111', 'utkarsh@hdfc', 50000.0, 'Utkarsh'),
+('11111111-1111-1111-1111-222222222222', 'sender@hdfc', 50000.0, 'Sender');
+
 -- id is the surrogate PK; (txn_id, operation_type) enforces idempotency.
 -- A debit, credit, or compensation for the same txn_id can each exist once.
 CREATE TABLE transactions (
@@ -39,6 +43,10 @@ CREATE TABLE accounts (
     status VARCHAR(50) DEFAULT 'ACTIVE'
 );
 
+INSERT INTO accounts (account_id, vpa, balance, user_name) VALUES 
+('22222222-2222-2222-2222-111111111111', 'alice@sbi', 1000.0, 'Alice'),
+('22222222-2222-2222-2222-222222222222', 'receiver@sbi', 1000.0, 'Receiver');
+
 -- Same idempotency-safe schema as db_bank_hdfc.
 CREATE TABLE transactions (
     id             BIGSERIAL PRIMARY KEY,
@@ -58,6 +66,12 @@ CREATE TABLE vpa_registry (
     account_id UUID NOT NULL,
     is_active BOOLEAN DEFAULT TRUE
 );
+
+INSERT INTO vpa_registry (vpa, bank_service_url, account_id) VALUES 
+('utkarsh@hdfc', 'http://bank-hdfc:8001', '11111111-1111-1111-1111-111111111111'),
+('sender@hdfc', 'http://bank-hdfc:8001', '11111111-1111-1111-1111-222222222222'),
+('alice@sbi', 'http://bank-sbi:8002', '22222222-2222-2222-2222-111111111111'),
+('receiver@sbi', 'http://bank-sbi:8002', '22222222-2222-2222-2222-222222222222');
 
 -- Durable saga state for each payment transaction.
 -- The gateway persists state at every step so crashes can be recovered.

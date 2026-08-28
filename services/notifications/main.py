@@ -34,7 +34,7 @@ notification_processing_duration_seconds = Histogram(
     'notification_processing_duration_seconds', 'Time to process notification events'
 )
 
-KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
+KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
 
 # In-memory deduplication set: (txn_id, event_type) pairs we've already notified about.
 # Bounded to avoid unbounded memory growth — evict oldest entries when over limit.

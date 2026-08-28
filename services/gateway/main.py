@@ -29,14 +29,14 @@ app = FastAPI(title="PayFlow UPI Gateway")
 # ---------------------------------------------------------------------------
 
 GATEWAY_DB_URL = os.getenv(
-    "GATEWAY_DATABASE_URL",
-    "postgresql://payflow_admin:secretpassword@localhost:5432/db_gateway"
+    "DATABASE_URL",
+    "postgresql://payflow_admin:secretpassword@postgres:5432/db_gateway"
 )
 
 # Hardcoded service registry for local testing (Nginx will handle this in prod)
 BANK_URLS = {
-    "hdfc": "http://127.0.0.1:8001",
-    "sbi": "http://127.0.0.1:8002"
+    "hdfc": os.getenv("HDFC_BANK_URL", "http://bank-hdfc:8001"),
+    "sbi": os.getenv("SBI_BANK_URL", "http://bank-sbi:8002")
 }
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from shared.logger import get_logger
 
 logger = get_logger("bank_sbi")
 app = FastAPI(title="SBI Bank Service")
-DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@localhost:5432/db_bank_sbi")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_bank_sbi")
 
 import time
 from fastapi import Request

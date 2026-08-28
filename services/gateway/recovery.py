@@ -36,6 +36,8 @@ import logging
 import httpx
 import uuid
 import time
+import os
+from typing import Optional
 from prometheus_client import Counter, Histogram, Gauge
 from shared.logger import get_logger
 
@@ -159,10 +161,10 @@ async def _recovery_scan(db_pool, kafka_publish_fn) -> None:
         sender_bank = sender_vpa.split("@")[1]
         receiver_bank = receiver_vpa.split("@")[1]
         
-        # Hardcoded fallback for tests
+        # Hardcoded fallback for tests and docker networking
         BANK_URLS_FALLBACK = {
-            "hdfc": "http://127.0.0.1:8001",
-            "sbi": "http://127.0.0.1:8002"
+            "hdfc": os.getenv("HDFC_BANK_URL", "http://bank-hdfc:8001"),
+            "sbi": os.getenv("SBI_BANK_URL", "http://bank-sbi:8002")
         }
 
         # Resolve sender URL

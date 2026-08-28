@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+redis
+pydantic
+aiokafka
+asyncpg
+httpx
+prometheus-client

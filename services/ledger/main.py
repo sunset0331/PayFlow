@@ -11,7 +11,7 @@ from shared.logger import get_logger
 logger = get_logger("ledger")
 
 app = FastAPI(title="Ledger Service")
-DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@127.0.0.1:5433/db_ledger")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_ledger")
 
 import time
 from prometheus_client import Counter, Histogram, generate_latest
@@ -26,7 +26,7 @@ async def metrics():
     return Response(content=generate_latest(), media_type="text/plain")
 
 
-KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "127.0.0.1:9092")
+KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
 
 # ---------------------------------------------------------------------------
 # Dead-Letter Queue handling
