@@ -48,7 +48,7 @@ gateway_recovery_duration_seconds = Histogram('gateway_recovery_duration_seconds
 gateway_stale_sagas = Gauge('gateway_stale_sagas', 'Number of stale sagas found in the last scan')
 
 # How long a saga must be stuck before the recovery worker intervenes (seconds)
-SAGA_STALE_THRESHOLD_SECONDS = 30
+SAGA_STALE_THRESHOLD_SECONDS = 120
 
 # How often to run the recovery scan (seconds)
 RECOVERY_POLL_INTERVAL_SECONDS = 15

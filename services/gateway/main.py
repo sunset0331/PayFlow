@@ -20,6 +20,7 @@ from shared.kafka_client import start_kafka_producer, stop_kafka_producer, publi
 from shared.rate_limiter import enforce_rate_limits
 from services.gateway.recovery import run_recovery_worker
 from services.gateway.outbox import run_outbox_publisher
+from services.gateway.orchestrator import run_orchestrator
 
 logger = get_logger("gateway")
 
@@ -135,6 +136,23 @@ async def startup_event():
         _supervised_outbox_worker(app.state.db_pool)
     )
 
+    # Launch the saga orchestrator background task
+    app.state.orchestrator_task = asyncio.create_task(
+        _supervised_orchestrator_worker(app.state.db_pool)
+    )
+
+async def _supervised_orchestrator_worker(db_pool) -> None:
+    """Wraps run_orchestrator with a restart loop."""
+    while True:
+        try:
+            await run_orchestrator(db_pool)
+        except asyncio.CancelledError:
+            logger.info("Orchestrator worker cancelled. Shutting down.")
+            break
+        except Exception as e:
+            logger.error("Orchestrator worker crashed, restarting in 5s: %s", e, exc_info=True)
+            await asyncio.sleep(5)
+
 async def _supervised_outbox_worker(db_pool) -> None:
     """Wraps run_outbox_publisher with a restart loop."""
     while True:
@@ -174,6 +192,13 @@ async def shutdown_event():
         app.state.outbox_task.cancel()
         try:
             await app.state.outbox_task
+        except asyncio.CancelledError:
+            pass
+
+    if hasattr(app.state, 'orchestrator_task') and app.state.orchestrator_task:
+        app.state.orchestrator_task.cancel()
+        try:
+            await app.state.orchestrator_task
         except asyncio.CancelledError:
             pass
 
