@@ -60,7 +60,7 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
         mock_client_cls.__aenter__.return_value = mock_client_instance
         
         with patch('services.gateway.recovery.httpx.AsyncClient', return_value=mock_client_cls):
-            with patch('services.gateway.recovery._update_saga', new_callable=AsyncMock) as mock_update:
+            with patch('services.gateway.recovery._saga_update_guarded_with_outbox', new_callable=AsyncMock, return_value=True) as mock_update:
                 await _recover_debit_completed(
                     self.txn_id, self.sender_url, self.sender_vpa, 
                     self.receiver_url, self.receiver_vpa, self.amount, 
@@ -68,8 +68,8 @@ class TestSagaRecovery(unittest.IsolatedAsyncioTestCase):
                 )
         
                 # After guard succeeds (DEBIT_COMPLETED→CREDIT_PENDING), HTTP credit is made,
-                # then _update_saga is called once with COMPLETED.
-                update_states = [c[0][2] for c in mock_update.call_args_list]
+                # then _saga_update_guarded_with_outbox is called once with COMPLETED.
+                update_states = [c[0][3] for c in mock_update.call_args_list]
                 self.assertIn("COMPLETED", update_states)
         
         # Kafka event was published

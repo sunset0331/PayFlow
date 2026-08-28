@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import asyncpg
 import asyncpg.exceptions
 import os
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
         await app.state.pool.close()
 
 app = FastAPI(title="SBI Bank Service", lifespan=lifespan)
-DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_bank_sbi")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:dummy_pass@postgres:5432/db_bank_sbi")
 
 import time
 from fastapi import Request
@@ -56,7 +56,7 @@ async def metrics():
 
 class TransactionPayload(BaseModel):
     vpa: str
-    amount: Decimal
+    amount: Decimal = Field(..., gt=0)
     txn_id: str
     # operation_type lets the gateway distinguish DEBIT from COMPENSATION credits.
     # Defaults preserve backward compatibility if caller omits the field.
@@ -65,7 +65,7 @@ class TransactionPayload(BaseModel):
 class AccountPayload(BaseModel):
     vpa: str
     user_name: str
-    initial_balance: Decimal = Decimal("0.00")
+    initial_balance: Decimal = Field(Decimal("0.00"), ge=0)
 
 
 

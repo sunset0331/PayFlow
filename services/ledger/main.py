@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Ledger Service", lifespan=lifespan)
-DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_ledger")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:dummy_pass@postgres:5432/db_ledger")
 
 import time
 from prometheus_client import Counter, Histogram, generate_latest
@@ -45,11 +45,8 @@ async def metrics():
 KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "kafka:9092")
 
 # ---------------------------------------------------------------------------
-# Dead-Letter Queue handling
+# Retry handling
 # ---------------------------------------------------------------------------
-# Messages that fail to process MAX_CONSECUTIVE_FAILURES times in a row
-# are moved to the DLQ (a local in-memory list for now; replace with a
-# Kafka DLQ topic or a DB table in production).
 MAX_RETRIES_PER_MESSAGE = 3
 
 
@@ -114,22 +111,16 @@ async def consume_events() -> None:
                 except Exception as e:
                     retries += 1
                     if retries > MAX_RETRIES_PER_MESSAGE:
-                        # Poison message: move to DLQ, commit offset, continue
+                        # In a real system, move to a permanent DLQ. For now, log and discard.
                         logger.error(
-                            "Moved message to DLQ after %d retries",
+                            "Dropped message after %d retries",
                             MAX_RETRIES_PER_MESSAGE,
-                            extra={"txn_id": event.get('txn_id'), "event": "LEDGER_DLQ_ROUTED", "event_type": event.get('event_type')},
+                            extra={"txn_id": event.get('txn_id'), "event": "LEDGER_DROPPED", "event_type": event.get('event_type')},
                             exc_info=True
                         )
                         ledger_dlq_total.labels(reason="max_retries_exceeded").inc()
                         ledger_events_total.labels(event_type=event.get('event_type', 'unknown'), status="failed").inc()
                         ledger_event_processing_duration_seconds.observe(time.time() - start_time)
-                        _dlq.append({
-                            "partition": msg.partition,
-                            "offset": msg.offset,
-                            "event": event,
-                            "error": str(e),
-                        })
                     else:
                         wait = 2 ** retries  # exponential backoff: 2s, 4s, 8s
                         logger.warning(
@@ -173,16 +164,3 @@ async def get_transaction_history(txn_id: str):
             {"event_type": r['event_type'], "payload": json.loads(r['payload_json']), "timestamp": r['timestamp']}
             for r in records
         ]
-
-@app.get("/ledger/dlq/peek")
-async def peek_dlq():
-    """Inspect messages that failed processing and ended up in the DLQ."""
-    async with app.state.db_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT count(*) FROM dead_letter_queue")
-        records = await conn.fetch("SELECT * FROM dead_letter_queue ORDER BY created_at DESC LIMIT 10")
-        import json
-        messages = [
-            {"id": r["id"], "topic": r["topic"], "payload": json.loads(r["payload"]), "error_reason": r["error_reason"], "created_at": r["created_at"]}
-            for r in records
-        ]
-        return {"dlq_size": count, "messages": messages}

@@ -364,11 +364,21 @@ async def _recover_debit_completed(
                 )
                 resp.raise_for_status()
 
+            outbox_payload = {
+                "topic": "payment_events",
+                "event_type": "PAYMENT_SUCCESS",
+                "payload": {"status": "completed", "recovered": True}
+            }
+            advanced = await _saga_update_guarded_with_outbox(
+                db_pool, txn_id, "CREDIT_PENDING", "COMPLETED", None, [outbox_payload]
+            )
+            if not advanced:
+                logger.info("CREDIT_PENDING→COMPLETED guarded update preempted after retry.",
+                            extra={"txn_id": txn_id, "event": "RECOVERY_PREEMPTED"})
+                return
+
             logger.info("CREDIT successful. Marking COMPLETED.",
                         extra={"txn_id": txn_id, "event": "RECOVERY_ACTION"})
-            await _update_saga(db_pool, txn_id, "COMPLETED")
-            await kafka_publish_fn("payment_events", txn_id, "PAYMENT_SUCCESS",
-                                   {"status": "completed", "recovered": True})
 
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             gateway_recovery_total.labels(status="retrying", saga_state="DEBIT_COMPLETED").inc()

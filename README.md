@@ -144,11 +144,11 @@ pip install -r requirements.txt
 4. Run Microservices (in separate terminals):
 ```bash
 # HDFC Bank
-export DATABASE_URL="postgresql://payflow_admin:secretpassword@127.0.0.1:5433/db_bank_hdfc"
+export DATABASE_URL="postgresql://payflow_admin:dummy_pass@127.0.0.1:5433/db_bank_hdfc"
 uvicorn services.bank_hdfc.main:app --port 8001
 
 # SBI Bank
-export DATABASE_URL="postgresql://payflow_admin:secretpassword@127.0.0.1:5433/db_bank_sbi"
+export DATABASE_URL="postgresql://payflow_admin:dummy_pass@127.0.0.1:5433/db_bank_sbi"
 uvicorn services.bank_sbi.main:app --port 8002
 
 # Ledger Service

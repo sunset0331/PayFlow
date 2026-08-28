@@ -13,7 +13,7 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
 logger = get_logger("reconciliation_worker")
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:secretpassword@postgres:5432/db_gateway")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://payflow_admin:dummy_pass@postgres:5432/db_gateway")
 LEDGER_URL = os.getenv("LEDGER_URL", "http://ledger:8004")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "120"))
